@@ -1,8 +1,8 @@
 # xhx2api — 小浣熊 OpenAI 兼容反代
 
 把商汤「小浣熊」（`xiaohuanxiong.com`）网页端 / 桌面端所依赖的 LLM 网关，逆向成本地一个
-**OpenAI 兼容**的 HTTP 反代：客户端用 OpenAI SDK / `curl` 指向本服务，请求会被转发到小浣熊上游，
-响应（含流式、思维链、function calling、usage）原样回传。
+**OpenAI 兼容**的 HTTP 反代：客户端用 OpenAI SDK / `curl` 指向本服务，请求会被转发到小浣熊上游
+（含 OpenAI 多模态 `content` 数组，也就是可以直接带图片），响应（含流式、思维链、function calling、usage）原样回传。
 
 - **上游**：商汤小浣熊官方接口 `https://xiaohuanxiong.com`（使用你自己的账号登录后取得的 token）。
 - **用途**：**仅个人学习与自用**。本项目与商汤科技（SenseTime）**没有任何关系**，非官方、未获授权。
@@ -18,6 +18,7 @@
 - [配置项说明](#配置项说明)
 - [账号文件与 token 获取](#账号文件与-token-获取)
 - [HTTP 端点](#http-端点)
+- [图片输入（多模态）](#图片输入多模态)
 - [管理面板](#管理面板)
 - [每日签到](#每日签到)
 - [限制与排障](#限制与排障)
@@ -258,7 +259,7 @@ curl -sN -H 'Content-Type: application/json' \
 | GET | `/healthz` | 无 | 健康检查：`{"status":"ok","version":…,"uptime_seconds":…,"accounts":{…},"models":…}`。 |
 | GET | `/favicon.ico` | 无 | 返回 204（在鉴权前短路）。 |
 | GET | `/v1/models` | `api_key` | OpenAI 模型列表（仅上游目录条目；目录为空时 `data` 为空数组）。 |
-| POST | `/v1/chat/completions` | `api_key` | 聊天补全，支持流式/非流式、思维链、function calling。 |
+| POST | `/v1/chat/completions` | `api_key` | 聊天补全，支持流式/非流式、思维链、function calling、图片输入（见[图片输入（多模态）](#图片输入多模态)）。 |
 | GET | `/admin`、`/admin/` | `admin.api_key` | 内嵌管理面板 HTML。 |
 | GET | `/admin/api/*` | `admin.api_key` | 只读 JSON 接口（见下）。 |
 | POST/PATCH/DELETE | `/admin/api/accounts…` | `admin.api_key` | 账号管理写接口（见「面板管理账号」）。 |
@@ -275,6 +276,30 @@ curl -sN -H 'Content-Type: application/json' \
 | `/admin/api/models` | 模型目录条目。 |
 | `/admin/api/requests?limit=N` | 最近 N 条请求日志（默认 100）。 |
 | `/admin/api/checkin` | 每账号的每日签到状态与历史。 |
+
+---
+
+## 图片输入（多模态）
+
+`/v1/chat/completions` 的 `messages[].content` 支持 OpenAI 的多模态数组写法，图片会随请求一起转发给上游模型：
+
+```bash
+IMG=$(base64 -w0 photo.jpg)   # macOS 用：IMG=$(base64 -i photo.jpg)
+curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>" \
+  -d "{\"model\":\"sn-glm-5-3-flash\",\"messages\":[{\"role\":\"user\",\"content\":[
+      {\"type\":\"text\",\"text\":\"这张图里是什么？\"},
+      {\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/jpeg;base64,$IMG\"}}]}]}" \
+  http://127.0.0.1:3066/v1/chat/completions
+```
+
+- 流式 / 非流式都支持；`usage.prompt_tokens` 里包含图片占用的 token（实测 2MB JPEG 约 8000）。
+- **优先用 `data:` URL**：传远程 `http(s)` 地址时是**上游服务器去下载**那个地址，墙外地址会一直等到超时
+  （`upstream.response_header_timeout_seconds`）。
+- 图片作为请求体的一部分转发，大小上限同 `maxChatBodyBytes`（64MB）。
+- 实测可识别图片的模型：`sn-glm-5-3-flash`、`sn-sensenova-6-8-flash`、`sn-deepseek-v4-1-flash`、
+  `sn-kimi-k3`（较慢，单张图可能一两分钟）。
+- 这是上游 chat 接口自带的能力；**网页端的「上传文件」入口**（先把文件传到小浣熊侧再引用）未做逆向，
+  本服务不需要它。
 
 ---
 
@@ -375,6 +400,7 @@ curl -sN -H 'Content-Type: application/json' \
 - 生效：`ssh ai 'cd /zfspool/data/ai/cpamp && docker compose restart cli-proxy-api'`
 - 挂上后模型对外名带前缀（`xhx/sn-glm-5-3-flash`）。验证：
   `curl -s -H "Authorization: Bearer <CPA key>" http://10.1.0.8:8317/v1/models | grep xhx`
+- 图片输入经 CPA 同样可用（实测 `xhx/sn-glm-5-3-flash` 流式/非流式都正常，`usage` 里的图片 token 也保留）。
 - 现成片段（含真实 api_key，放在不进 git 的 `data/` 下）：`data/cpa-provider-snippet.yaml`
 
 ---
@@ -395,7 +421,8 @@ curl -sN -H 'Content-Type: application/json' \
 
 ### 已知限制
 
-- 仅代理**文本**聊天与 function calling；上游网页端的**图片/文件上传**等能力不在此反代范围内。
+- 支持**文本**聊天、function calling 与**图片输入**（OpenAI 多模态 `content` 数组，见[图片输入（多模态）](#图片输入多模态)）；
+  上游网页端的**「上传文件」入口**（先把文件传到小浣熊侧、再在对话里引用）未做逆向，本项目不需要它。
 - **不支持**注册机、新手任务等；网页登录已支持（见「网页登录」），也可手动粘贴 token。
 - 上游模型行为、额度、风控策略随时可能变化，本项目不保证长期可用。
 - 单账号被多处同时刷新会互相顶掉（见上文 token 说明）。
