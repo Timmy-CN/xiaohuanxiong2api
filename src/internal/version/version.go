@@ -5,4 +5,4 @@
 package version
 
 // Version 是二进制版本号（可被 ldflags 覆盖）。
-var Version = "0.1.0"
+var Version = "0.2.0"

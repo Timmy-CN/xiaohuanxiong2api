@@ -168,6 +168,8 @@
   .test-result.err { color: var(--err); }
   td.actions-cell { white-space: nowrap; }
   td.actions-cell .btn { margin-right: 4px; }
+  /* 错误列：长文本截断显示，完整内容在 title 里；有错误时才染红。 */
+  td.err-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--err); }
   @media (max-width: 720px) {
     body { padding: 10px; }
     .topbar { gap: 8px 16px; }
@@ -288,7 +290,7 @@
   <div class="scroll">
     <table>
       <thead><tr>
-        <th>时间</th><th>客户端模型</th><th>上游模型</th><th>账号</th><th>状态</th>
+        <th>时间</th><th>客户端模型</th><th>上游模型</th><th>账号</th><th>状态</th><th>错误</th>
         <th>耗时</th><th>流式</th><th>输入 token</th><th>输出 token</th><th>思维链 token</th>
       </tr></thead>
       <tbody id="requests-body"></tbody>
@@ -359,6 +361,26 @@
     span.className = "badge " + cls;
     span.textContent = label;
     cell.appendChild(span);
+    return cell;
+  }
+
+  // 错误单元格：主文本 + 悬浮全文；上游状态码/业务码作为后缀补充细节。
+  function tdError(r) {
+    var cell = document.createElement("td");
+    var parts = [];
+    if (r.error) {
+      parts.push(r.error);
+      if (r.upstream_status !== undefined && r.upstream_status !== null && r.upstream_status !== r.status) {
+        parts.push("（上游 HTTP " + r.upstream_status + "）");
+      }
+      if (r.upstream_code !== undefined && r.upstream_code !== null) {
+        parts.push("（上游 code=" + r.upstream_code + "）");
+      }
+    }
+    var text = parts.length ? parts.join("") : "—";
+    cell.textContent = text;      // 必须用 textContent，不许拼 HTML
+    cell.title = text;            // 悬浮看全文
+    if (parts.length) cell.className = "err-cell";
     return cell;
   }
 
@@ -833,6 +855,7 @@
           td(r.model),
           td(r.account),
           tdBadge(text(r.status), cls),
+          tdError(r),
           td(fmtMs(r.duration_ms), "num"),
           td(r.stream ? "是" : "否"),
           td(r.prompt_tokens, "num"),
@@ -840,7 +863,7 @@
           td(r.reasoning_tokens, "num")
         ]));
       });
-      setBody("requests-body", rows.length ? rows : [emptyRow(10, "暂无请求")]);
+      setBody("requests-body", rows.length ? rows : [emptyRow(11, "暂无请求")]);
       return true;
     });
   }

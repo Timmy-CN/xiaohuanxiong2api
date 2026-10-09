@@ -12,15 +12,30 @@ import (
 	"time"
 )
 
-const maxChatBodyBytes = 64 << 20
+var maxChatBodyBytes int64 = 64 << 20
 
 // handleChat 实现 POST /v1/chat/completions（SPEC §6.3）。
 func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
+	// 日志条目在函数开头创建，defer 收尾，保证所有返回路径都恰好落一条日志（SPEC-A §2）。
+	entry := RequestLog{Time: nowRFC3339(), Method: http.MethodPost, Path: "/v1/chat/completions"}
+	started := time.Now()
+	defer func() {
+		entry.DurationMs = time.Since(started).Milliseconds()
+		s.logs.Add(entry)
+		if s.cfg.Log.AccessLogEnabled() {
+			s.logger.Infof("[access] %s %s model=%s client_model=%s account=%s status=%d stream=%v duration_ms=%d prompt=%d completion=%d reasoning=%d error=%s",
+				entry.Method, entry.Path, entry.Model, entry.ClientModel, entry.Account, entry.Status, entry.Stream,
+				entry.DurationMs, entry.PromptTokens, entry.CompletionTokens, entry.ReasoningTokens, entry.Error)
+		}
+	}()
+
 	r.Body = http.MaxBytesReader(w, r.Body, maxChatBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
+			entry.Status = http.StatusRequestEntityTooLarge
+			entry.Error = "请求体超过 64MB 上限"
 			writeError(w, http.StatusRequestEntityTooLarge, apiError{
 				Message: "请求体超过 64MB 上限",
 				Type:    typeInvalidRequest,
@@ -28,6 +43,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+		entry.Status = http.StatusBadRequest
+		entry.Error = "读取请求体失败：" + err.Error()
 		writeError(w, http.StatusBadRequest, apiError{
 			Message: "读取请求体失败：" + err.Error(),
 			Type:    typeInvalidRequest,
@@ -37,6 +54,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	fields := map[string]json.RawMessage{}
 	if err := json.Unmarshal(body, &fields); err != nil {
+		entry.Status = http.StatusBadRequest
+		entry.Error = "请求体不是合法 JSON：" + err.Error()
 		writeError(w, http.StatusBadRequest, apiError{
 			Message: "请求体不是合法 JSON：" + err.Error(),
 			Type:    typeInvalidRequest,
@@ -62,6 +81,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			s.logger.Warnf("[chat] 警告：模型目录为空，跳过模型校验（model=%s）", resolvedClient)
 		} else if !s.catalog.Has(upstreamModel) {
 			s.logger.Warnf("[chat] 未知模型 %s，拒绝请求（可用模型见 /v1/models）", resolvedClient)
+			entry.Status = http.StatusBadRequest
+			entry.Error = "未知模型 " + resolvedClient + "，可用模型见 /v1/models"
+			entry.ClientModel = resolvedClient
+			entry.Model = resolvedClient
 			writeError(w, http.StatusBadRequest, apiError{
 				Message: "未知模型 " + resolvedClient + "，可用模型见 /v1/models",
 				Type:    typeInvalidRequest,
@@ -75,6 +98,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if raw, ok := fields["stream"]; ok {
 		_ = json.Unmarshal(raw, &stream)
 	}
+	entry.Model = upstreamModel
+	entry.ClientModel = resolvedClient
+	entry.Stream = stream
 
 	// 只替换 model 键，其余字段原样保留（SPEC §6.3.4）。
 	modelJSON, err := json.Marshal(upstreamModel)
@@ -88,25 +114,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, apiError{Message: "序列化请求体失败", Type: typeInvalidRequest})
 		return
 	}
-
-	entry := RequestLog{
-		Time:        nowRFC3339(),
-		Method:      http.MethodPost,
-		Path:        "/v1/chat/completions",
-		Model:       upstreamModel,
-		ClientModel: resolvedClient,
-		Stream:      stream,
-	}
-	started := time.Now()
-	defer func() {
-		entry.DurationMs = time.Since(started).Milliseconds()
-		s.logs.Add(entry)
-		if s.cfg.Log.AccessLogEnabled() {
-			s.logger.Infof("[access] %s %s model=%s client_model=%s account=%s status=%d stream=%v duration_ms=%d prompt=%d completion=%d reasoning=%d error=%s",
-				entry.Method, entry.Path, entry.Model, entry.ClientModel, entry.Account, entry.Status, entry.Stream,
-				entry.DurationMs, entry.PromptTokens, entry.CompletionTokens, entry.ReasoningTokens, entry.Error)
-		}
-	}()
 
 	// 请求级总超时（0 = 不设，长回答流式）。
 	ctx := r.Context()
@@ -197,6 +204,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			upErr := buildUpstreamError(resp.StatusCode, errBody)
 			entry.Status = resp.StatusCode
 			entry.Error = upErr.Message
+			entry.UpstreamStatus = upErr.UpstreamStatus
+			entry.UpstreamCode = upErr.UpstreamCode
 			writeError(w, resp.StatusCode, upErr)
 			return
 		}
@@ -217,6 +226,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", strconv.Itoa(int(s.cfg.Accounts.Cooldown().Seconds())))
 		entry.Status = http.StatusTooManyRequests
 		entry.Error = lastErr.Message
+		entry.UpstreamStatus = lastErr.UpstreamStatus
+		entry.UpstreamCode = lastErr.UpstreamCode
 		writeError(w, http.StatusTooManyRequests, lastErr)
 		return
 	}
@@ -225,6 +236,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	entry.Status = http.StatusBadGateway
 	entry.Error = lastErr.Message
+	entry.UpstreamStatus = lastErr.UpstreamStatus
+	entry.UpstreamCode = lastErr.UpstreamCode
 	writeError(w, http.StatusBadGateway, lastErr)
 }
 
@@ -324,6 +337,7 @@ func (s *Server) forwardStream(ctx context.Context, w http.ResponseWriter, resp 
 		if err != nil {
 			if err != io.EOF && ctx.Err() == nil {
 				s.logger.Warnf("[chat] 上游流中断：%v", err)
+				entry.Error = "上游流中断：" + err.Error()
 			}
 			break
 		}

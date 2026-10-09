@@ -20,6 +20,8 @@ type RequestLog struct {
 	CompletionTokens int64  `json:"completion_tokens"`
 	ReasoningTokens  int64  `json:"reasoning_tokens"`
 	Error            string `json:"error"`
+	UpstreamStatus   *int   `json:"upstream_status,omitempty"`
+	UpstreamCode     *int   `json:"upstream_code,omitempty"`
 }
 
 // LogBuffer 是保存最近 N 条请求日志的环形缓冲。

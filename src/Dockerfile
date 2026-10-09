@@ -4,7 +4,7 @@
 # 用 -ldflags 注入版本号；-buildvcs=false 因为构建上下文里没有 .git。
 FROM golang:1.24-bookworm AS build
 
-ARG VERSION=0.1.0
+ARG VERSION=0.2.0
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -buildvcs=false -trimpath \

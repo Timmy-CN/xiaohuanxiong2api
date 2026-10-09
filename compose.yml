@@ -9,7 +9,7 @@ services:
     build:
       context: ./src
       args:
-        VERSION: "0.1.0"
+        VERSION: "0.2.0"
     image: xhx2api:local
     container_name: xiaohuanxiong2api
     restart: unless-stopped
