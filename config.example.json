@@ -1,0 +1,64 @@
+{
+  "listen": "0.0.0.0:3066",          // 监听地址；非法必须报错退出
+  "api_key": "",                     // /v1 的 Bearer 鉴权；空 = 不鉴权
+  "upstream": {
+    "llm_base": "https://xiaohuanxiong.com/api/web/llm/v2",
+    "auth_base": "https://xiaohuanxiong.com/api/web/auth/v1",
+    "points_base": "https://xiaohuanxiong.com/api/web/points/v1",
+    "origin": "https://xiaohuanxiong.com",    // 主站 origin：签到与账单接口挂在这里（独立配置点，不从上面三条反推）
+    "connect_timeout_seconds": 30,           // TCP 建连
+    "response_header_timeout_seconds": 120,  // 等响应头
+    "request_timeout_seconds": 0,            // 0 = 不设总超时（长回答流式）
+    "refresh_timeout_seconds": 30,
+    "catalog_timeout_seconds": 10,
+    "balance_timeout_seconds": 20,
+    "bills_timeout_seconds": 25,             // 账单核对超时（签到用）
+    "insecure_skip_verify": false,
+    "user_agent": "xhx2api/0.1.0",
+    "extra_headers": {}                      // 附加到上游请求的头，键值都是字符串
+  },
+  "accounts": {
+    "file": "./data/accounts.json",
+    "strategy": "priority",            // priority | round_robin
+    "refresh_margin_seconds": 300,     // 过期前多久主动刷新
+    "cooldown_seconds": 600,           // 429/5xx 后该账号冷却时长
+    "max_attempts": 3,                 // 一次客户端请求最多尝试几个账号
+    "refresh_on_401": true             // 401 时强制刷新同账号并重试一次
+  },
+  "models": {
+    "default": "sn-glm-5-3-flash",     // 请求没给 model 时用它
+    "aliases": {                       // 对外别名 → 上游模型 id
+      "glm-5.3-flash": "sn-glm-5-3-flash",
+      "glm-5.3": "sn-glm-5-3",
+      "glm-5-3-flash": "sn-glm-5-3-flash",
+      "glm-5-3": "sn-glm-5-3"
+    },
+    "validate": "catalog",             // none = 不校验，原样透传；catalog = 不在目录里则 400
+    "catalog_cache_seconds": 600,
+    "catalog_cache_file": "./data/model_catalog.json",
+    "fallback": []                     // 空 = 用代码内置的 §1.2 那 9 条；非空则完全用它
+  },
+  "log": {
+    "level": "info",                   // debug | info | warn | error
+    "access_log": true,
+    "buffer_size": 500,                // 面板展示的最近请求条数
+    "file": ""                         // 空 = 只写 stdout
+  },
+  "admin": {
+    "enabled": true,
+    "api_key": "",                     // 面板与 /admin/api 的鉴权；空 = 不鉴权（仅内网）
+    "title": "小浣熊反代"
+  },
+  "checkin": {
+    "enabled": true,                   // 是否启用每日签到
+    "time": "00:01",                   // 本地时间 HH:MM（容器 TZ=Asia/Shanghai）
+    "on_start": true,                  // 启动时若「今天还没成功」立刻补一次
+    "verify_bills": true,              // true=以「今日确有入账」为成功；false=以 setting_info code==0 为成功
+    "bills_limit": 20,                 // 账单查询条数
+    "retry_interval_minutes": 30,      // 当天失败后的重试间隔
+    "max_attempts_per_day": 5,         // 当天最多尝试次数（含首次）
+    "history_file": "./data/checkin.json",
+    "history_days": 30                 // history 只保留最近 N 天
+  },
+  "shutdown_timeout_seconds": 10        // 优雅退出超时（SPEC §6.6）
+}

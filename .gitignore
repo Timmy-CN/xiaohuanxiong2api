@@ -1,0 +1,21 @@
+# 运行时数据（账号、目录缓存、日志）——不进 git
+data/
+
+# 实际配置（含密钥）——只提交 config.example.json
+config.json
+
+# 提示词脚手架
+SPEC.md
+SPEC*.md
+FIX*.md
+
+# 构建产物
+src/xhx2api
+bin/
+*.exe
+
+# 杂项
+.DS_Store
+*.log
+*.bak
+*.tmp

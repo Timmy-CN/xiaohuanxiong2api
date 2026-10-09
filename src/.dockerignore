@@ -1,0 +1,8 @@
+# 构建上下文排除项（SPEC3 §E2）。
+#
+# Dockerfile 用的是 `COPY . .`，若不排除，本机构建产物（约 9MB 的 src/xhx2api）
+# 与 .git 目录会被一并塞进构建上下文，既拖慢构建又可能污染镜像。
+xhx2api
+.git
+*.log
+data/

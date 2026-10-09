@@ -1,0 +1,23 @@
+# xhx2api 部署编排（SPEC2 §C.2）。
+#
+# 为什么显式 TZ=Asia/Shanghai：服务端日志时间戳与「每日签到」的触发时刻都按容器本地时区
+# 计算；宿主时区未必是东八区，若不显式指定，签到会在错误的时刻触发、日志时间也对不上。
+# 为什么端口用 3066：本服务与同机运行的 agent2api（默认 3065）区分开，避免端口冲突；
+# 容器内监听 3066，映射到宿主同端口。
+services:
+  xhx2api:
+    build:
+      context: ./src
+      args:
+        VERSION: "0.1.0"
+    image: xhx2api:local
+    container_name: xiaohuanxiong2api
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+    ports:
+      - "3066:3066"          # 与 agent2api（3065）区分；同机不同端口
+    volumes:
+      - ./data:/app/data
+      - ./config.json:/app/config.json:ro
+      - /usr/share/zoneinfo:/usr/share/zoneinfo:ro   # 宿主 zoneinfo 更新即时生效

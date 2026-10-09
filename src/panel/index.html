@@ -1,0 +1,496 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>小浣熊反代 · 管理面板</title>
+<style>
+  /* 暗色主题：颜色集中在 :root，便于统一调整（SPEC §7.2）。 */
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1c2430;
+    --border: #2b3442;
+    --text: #d6dee8;
+    --muted: #8b98a9;
+    --accent: #4c9aff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    padding: 16px;
+  }
+  .banner {
+    background: rgba(248, 81, 73, .14);
+    border: 1px solid var(--err);
+    color: var(--err);
+    padding: 8px 12px;
+    border-radius: var(--radius);
+    margin-bottom: 12px;
+    font-weight: 600;
+  }
+  .topbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 22px;
+    align-items: center;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .topbar h1 { font-size: 17px; margin: 0 14px 0 0; font-weight: 700; }
+  .stat { display: flex; flex-direction: column; min-width: 74px; }
+  .stat .k { color: var(--muted); font-size: 11px; letter-spacing: .04em; }
+  .stat .v { font-size: 14px; font-variant-numeric: tabular-nums; }
+  .spacer { flex: 1 1 auto; }
+  .updated { color: var(--muted); font-size: 12px; }
+  section { margin-bottom: 20px; }
+  section > h2 {
+    font-size: 14px; margin: 0 0 8px 0; font-weight: 600;
+    border-left: 3px solid var(--accent); padding-left: 8px;
+  }
+  .scroll {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--panel);
+  }
+  table { border-collapse: collapse; width: 100%; min-width: 640px; }
+  th, td {
+    padding: 7px 10px; text-align: left; white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    background: var(--panel-2); color: var(--muted);
+    font-weight: 600; font-size: 12px;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(76, 154, 255, .06); }
+  td.num { font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); padding: 12px; }
+  .badge {
+    display: inline-block; padding: 1px 7px; border-radius: 999px;
+    font-size: 11px; line-height: 1.6;
+  }
+  .b-ok { background: rgba(63, 185, 80, .15); color: var(--ok); }
+  .b-off { background: rgba(139, 152, 169, .15); color: var(--muted); }
+  .b-warn { background: rgba(210, 153, 34, .15); color: var(--warn); }
+  .b-err { background: rgba(248, 81, 73, .15); color: var(--err); }
+  .b-info { background: rgba(76, 154, 255, .15); color: var(--accent); }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 12px;
+  }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 14px;
+  }
+  .card .name { font-weight: 600; margin-bottom: 2px; }
+  .card .id { color: var(--muted); font-size: 12px; margin-bottom: 8px; word-break: break-all; }
+  .card .points { font-size: 24px; font-weight: 700; color: var(--accent); font-variant-numeric: tabular-nums; }
+  .card .points small { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+  .wallets { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; font-size: 12px; }
+  .wallets .w { display: flex; justify-content: space-between; color: var(--muted); }
+  .wallets .w b { color: var(--text); font-weight: 600; }
+  .card .err { color: var(--err); font-size: 12px; margin-top: 8px; word-break: break-all; }
+  .card .sub { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  @media (max-width: 720px) {
+    body { padding: 10px; }
+    .topbar { gap: 8px 16px; }
+    .topbar h1 { width: 100%; margin-bottom: 4px; }
+    .card .points { font-size: 20px; }
+  }
+</style>
+</head>
+<body>
+<div id="banner" class="banner" hidden>接口不可用</div>
+
+<div class="topbar">
+  <h1 id="title">小浣熊反代</h1>
+  <div class="stat"><span class="k">版本</span><span class="v" id="version">—</span></div>
+  <div class="stat"><span class="k">运行时长</span><span class="v" id="uptime">—</span></div>
+  <div class="stat"><span class="k">监听地址</span><span class="v" id="listen">—</span></div>
+  <div class="stat"><span class="k">模型数</span><span class="v" id="models-count">—</span></div>
+  <div class="stat"><span class="k">账号可用 / 总数</span><span class="v" id="accounts-count">—</span></div>
+  <div class="spacer"></div>
+  <span class="updated" id="updated">尚未刷新</span>
+</div>
+
+<section>
+  <h2>账号池</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>ID</th><th>名称</th><th>启用</th><th>Token 尾号</th><th>过期时间</th>
+        <th>剩余</th><th>冷却中</th><th>上次刷新</th><th>最近错误</th>
+      </tr></thead>
+      <tbody id="accounts-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>积分</h2>
+  <div class="cards" id="balance-cards"></div>
+</section>
+
+<section>
+  <h2>每日签到</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>账号</th><th>今日成功</th><th>今日积分</th><th>最后成功日期</th>
+        <th>今日尝试</th><th>最近消息</th><th>历史（最近 7 条）</th>
+      </tr></thead>
+      <tbody id="checkin-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>模型目录</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>ID</th><th>展示名</th><th>标签</th><th>上下文</th><th>最大输出</th><th>倍率</th><th>可见</th>
+      </tr></thead>
+      <tbody id="models-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>最近请求</h2>
+  <div class="scroll">
+    <table>
+      <thead><tr>
+        <th>时间</th><th>客户端模型</th><th>上游模型</th><th>账号</th><th>状态</th>
+        <th>耗时</th><th>流式</th><th>输入 token</th><th>输出 token</th><th>思维链 token</th>
+      </tr></thead>
+      <tbody id="requests-body"></tbody>
+    </table>
+  </div>
+</section>
+
+<script>
+(function () {
+  "use strict";
+
+  // 管理密钥可选：从 ?key= 读取后附加到每个 API 请求（与 /admin 的鉴权方式一致）。
+  var KEY = new URLSearchParams(window.location.search).get("key") || "";
+
+  function api(path) {
+    if (!KEY) return path;
+    return path + (path.indexOf("?") >= 0 ? "&" : "?") + "key=" + encodeURIComponent(KEY);
+  }
+
+  function getJSON(path) {
+    return fetch(api(path), { headers: { "Accept": "application/json" } }).then(function (r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    });
+  }
+
+  function text(v) {
+    if (v === undefined || v === null || v === "") return "—";
+    return String(v);
+  }
+
+  function td(value, cls) {
+    var cell = document.createElement("td");
+    if (cls) cell.className = cls;
+    cell.textContent = text(value);
+    return cell;
+  }
+
+  function tdBadge(label, cls) {
+    var cell = document.createElement("td");
+    var span = document.createElement("span");
+    span.className = "badge " + cls;
+    span.textContent = label;
+    cell.appendChild(span);
+    return cell;
+  }
+
+  function row(cells) {
+    var tr = document.createElement("tr");
+    for (var i = 0; i < cells.length; i++) tr.appendChild(cells[i]);
+    return tr;
+  }
+
+  function emptyRow(cols, msg) {
+    var tr = document.createElement("tr");
+    var cell = document.createElement("td");
+    cell.colSpan = cols;
+    cell.className = "empty";
+    cell.textContent = msg;
+    tr.appendChild(cell);
+    return tr;
+  }
+
+  function setBody(id, rows) {
+    var body = document.getElementById(id);
+    body.replaceChildren();
+    for (var i = 0; i < rows.length; i++) body.appendChild(rows[i]);
+  }
+
+  function fmtTime(ms) {
+    if (!ms || ms <= 0) return "—";
+    var d = new Date(ms);
+    if (isNaN(d.getTime())) return "—";
+    return d.toLocaleString();
+  }
+
+  function fmtUptime(sec) {
+    if (sec === undefined || sec === null) return "—";
+    sec = Math.floor(sec);
+    var d = Math.floor(sec / 86400);
+    var h = Math.floor((sec % 86400) / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    var s = sec % 60;
+    var out = "";
+    if (d > 0) out += d + "天";
+    if (d > 0 || h > 0) out += h + "时";
+    return out + m + "分" + s + "秒";
+  }
+
+  function fmtRemain(sec) {
+    if (sec === undefined || sec === null) return "—";
+    if (sec <= 0) return "已过期";
+    var d = Math.floor(sec / 86400);
+    var h = Math.floor((sec % 86400) / 3600);
+    var m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return d + "天" + h + "时";
+    if (h > 0) return h + "时" + m + "分";
+    return m + "分" + (sec % 60) + "秒";
+  }
+
+  function fmtMs(ms) {
+    if (ms === undefined || ms === null) return "—";
+    return ms + " ms";
+  }
+
+  // ── 1. 顶部状态条 ──
+  function loadStatus() {
+    return getJSON("/admin/api/status").then(function (s) {
+      var eff = s.effective_config || {};
+      var admin = eff.admin || {};
+      document.getElementById("title").textContent = text(admin.title);
+      document.getElementById("version").textContent = text(s.version);
+      document.getElementById("uptime").textContent = fmtUptime(s.uptime_seconds);
+      document.getElementById("listen").textContent = text(s.listen);
+      var models = s.models || {};
+      document.getElementById("models-count").textContent =
+        text(models.count) + (models.source ? "（" + models.source + "）" : "");
+      var acc = s.accounts || {};
+      document.getElementById("accounts-count").textContent =
+        text(acc.available) + " / " + text(acc.total);
+      return true;
+    });
+  }
+
+  // ── 2. 账号池表 ──
+  function loadAccounts() {
+    return getJSON("/admin/api/accounts").then(function (list) {
+      var rows = [];
+      (list || []).forEach(function (a) {
+        var cooldown = a.cooldown_until && a.cooldown_until > Date.now();
+        rows.push(row([
+          td(a.id),
+          td(a.name),
+          tdBadge(a.enabled ? "启用" : "停用", a.enabled ? "b-ok" : "b-off"),
+          td(a.token_tail),
+          td(fmtTime(a.expires_at)),
+          td(fmtRemain(a.expires_in_seconds), "num"),
+          tdBadge(cooldown ? "冷却中" : "否", cooldown ? "b-warn" : "b-off"),
+          td(fmtTime(a.last_refresh_at)),
+          td(a.last_error)
+        ]));
+      });
+      setBody("accounts-body", rows.length ? rows : [emptyRow(9, "暂无账号")]);
+      return true;
+    });
+  }
+
+  // ── 3. 积分卡 ──
+  function loadBalance() {
+    return getJSON("/admin/api/accounts/balance").then(function (list) {
+      var wrap = document.getElementById("balance-cards");
+      wrap.replaceChildren();
+      if (!list || !list.length) {
+        var none = document.createElement("div");
+        none.className = "empty";
+        none.textContent = "暂无数据";
+        wrap.appendChild(none);
+        return true;
+      }
+      list.forEach(function (b) {
+        var card = document.createElement("div");
+        card.className = "card";
+
+        var name = document.createElement("div");
+        name.className = "name";
+        name.textContent = text(b.name);
+        card.appendChild(name);
+
+        var id = document.createElement("div");
+        id.className = "id";
+        id.textContent = text(b.id);
+        card.appendChild(id);
+
+        if (b.error) {
+          var err = document.createElement("div");
+          err.className = "err";
+          err.textContent = b.error;
+          card.appendChild(err);
+        } else {
+          var points = document.createElement("div");
+          points.className = "points";
+          points.textContent = text(b.available_points);
+          var unit = document.createElement("small");
+          unit.textContent = "积分";
+          points.appendChild(unit);
+          card.appendChild(points);
+
+          var wallets = b.wallets || {};
+          var grid = document.createElement("div");
+          grid.className = "wallets";
+          [["每日", "daily_points"], ["每月会员", "monthly_points"],
+           ["奖励", "reward_points"], ["充值", "topup_points"]].forEach(function (pair) {
+            var item = document.createElement("div");
+            item.className = "w";
+            var key = document.createElement("span");
+            key.textContent = pair[0];
+            var val = document.createElement("b");
+            val.textContent = text(wallets[pair[1]]);
+            item.appendChild(key);
+            item.appendChild(val);
+            grid.appendChild(item);
+          });
+          card.appendChild(grid);
+
+          var sub = b.subscription || {};
+          if (sub.office_pro_enable !== undefined) {
+            var line = document.createElement("div");
+            line.className = "sub";
+            line.textContent = "Office 会员：" + (sub.office_pro_enable ? "已开通" : "未开通") +
+              (sub.office_active_plan_type ? "（" + sub.office_active_plan_type + "）" : "");
+            card.appendChild(line);
+          }
+        }
+        wrap.appendChild(card);
+      });
+      return true;
+    });
+  }
+
+  // ── 4. 每日签到表 ──
+  function loadCheckin() {
+    return getJSON("/admin/api/checkin").then(function (list) {
+      var rows = [];
+      (list || []).forEach(function (c) {
+        var today = c.today || {};
+        var history = (c.history || []).slice(-7).map(function (h) {
+          return h.date + " " + (h.success ? "✓" : "✗") + (h.points ? "+" + h.points : "");
+        }).join("；");
+        rows.push(row([
+          td(c.id + (c.name ? "（" + c.name + "）" : "")),
+          tdBadge(today.success ? "成功" : (c.skipped_reason || "未成功"), today.success ? "b-ok" : "b-off"),
+          td(today.points, "num"),
+          td(c.last_date),
+          td(c.attempts_today, "num"),
+          td(c.last_msg),
+          td(history)
+        ]));
+      });
+      setBody("checkin-body", rows.length ? rows : [emptyRow(7, "暂无签到记录")]);
+      return true;
+    });
+  }
+
+  // ── 5. 模型目录表（别名单独一行标注）──
+  function loadModels() {
+    return getJSON("/admin/api/models").then(function (payload) {
+      var rows = [];
+      ((payload && payload.models) || []).forEach(function (m) {
+        rows.push(row([
+          td(m.id),
+          td(m.display_name),
+          td((m.tags || []).join(", ")),
+          td(m.max_input_tokens, "num"),
+          td(m.max_output_tokens, "num"),
+          td(m.credits),
+          tdBadge(m.visible ? "可见" : "隐藏", m.visible ? "b-ok" : "b-off")
+        ]));
+      });
+      var aliases = (payload && payload.aliases) || {};
+      Object.keys(aliases).sort().forEach(function (alias) {
+        rows.push(row([
+          td(alias),
+          td("→ " + aliases[alias]),
+          tdBadge("别名", "b-info"),
+          td("—"), td("—"), td("—"), td("—")
+        ]));
+      });
+      setBody("models-body", rows.length ? rows : [emptyRow(7, "暂无模型")]);
+      return true;
+    });
+  }
+
+  // ── 6. 最近请求表 ──
+  function loadRequests() {
+    return getJSON("/admin/api/requests?limit=100").then(function (list) {
+      var rows = [];
+      (list || []).forEach(function (r) {
+        var cls = r.status >= 200 && r.status < 300 ? "b-ok" : (r.status >= 400 ? "b-err" : "b-off");
+        rows.push(row([
+          td(r.time),
+          td(r.client_model),
+          td(r.model),
+          td(r.account),
+          tdBadge(text(r.status), cls),
+          td(fmtMs(r.duration_ms), "num"),
+          td(r.stream ? "是" : "否"),
+          td(r.prompt_tokens, "num"),
+          td(r.completion_tokens, "num"),
+          td(r.reasoning_tokens, "num")
+        ]));
+      });
+      setBody("requests-body", rows.length ? rows : [emptyRow(10, "暂无请求")]);
+      return true;
+    });
+  }
+
+  var banner = document.getElementById("banner");
+  var updated = document.getElementById("updated");
+
+  // 每 5 秒自动刷新；任一接口失败时显示「接口不可用」，但不清空已有数据。
+  function refreshAll() {
+    var tasks = [loadStatus(), loadAccounts(), loadBalance(), loadCheckin(), loadModels(), loadRequests()];
+    return Promise.all(tasks.map(function (p) {
+      return p.then(function () { return true; }, function () { return false; });
+    })).then(function (oks) {
+      var ok = oks.every(function (x) { return x; });
+      banner.hidden = ok;
+      updated.textContent = (ok ? "更新于 " : "接口不可用 · ") + new Date().toLocaleTimeString();
+    });
+  }
+
+  refreshAll();
+  setInterval(refreshAll, 5000);
+})();
+</script>
+</body>
+</html>
