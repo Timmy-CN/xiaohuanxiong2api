@@ -20,6 +20,9 @@
     --radius: 10px;
   }
   * { box-sizing: border-box; }
+  /* hidden 必须真正不占空间：.login-box/.add-form 自带 display:flex/grid，
+     会覆盖 UA 的 [hidden]{display:none}，这里显式兜底（SPEC6 §N1）。 */
+  [hidden] { display: none !important; }
   html, body { margin: 0; padding: 0; }
   body {
     background: var(--bg);
@@ -118,6 +121,11 @@
     background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600;
   }
   button.btn.primary:hover:not(:disabled) { background: #6badff; color: #0b1220; }
+  /* 折叠开关展开时的高亮，收起时移除（SPEC6 §N1）。 */
+  button.btn.active {
+    border-color: var(--accent); color: var(--accent);
+    background: rgba(76, 154, 255, .12);
+  }
   .login-box {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px;
@@ -132,9 +140,11 @@
   }
   .login-box .ttl { color: var(--muted); font-size: 12px; }
   .add-form {
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    display: grid;
+    grid-template-columns: minmax(220px, 320px) minmax(120px, 200px) 1fr;
     gap: 10px 14px; background: var(--panel); border: 1px solid var(--border);
     border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px;
+    align-items: start;
   }
   .add-form .field { display: flex; flex-direction: column; gap: 4px; }
   .add-form .wide { grid-column: 1 / -1; }
@@ -144,8 +154,11 @@
     border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%;
   }
   .add-form textarea { resize: vertical; }
-  .add-form .actions { flex-direction: row; align-items: center; gap: 8px; }
-  .add-form .check { flex-direction: row; align-items: center; gap: 8px; }
+  .add-form .actions {
+    flex-direction: row; align-items: center; gap: 8px;
+    justify-content: flex-start; grid-column: 3; align-self: end;
+  }
+  .add-form .check { flex-direction: row; align-items: center; gap: 8px; align-self: end; }
   .add-form .check input { width: auto; }
   .form-msg { font-size: 12px; }
   .form-msg.err { color: var(--err); }
@@ -160,6 +173,8 @@
     .topbar { gap: 8px 16px; }
     .topbar h1 { width: 100%; margin-bottom: 4px; }
     .card .points { font-size: 20px; }
+    .add-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .add-form .actions { grid-column: 1 / -1; }
   }
 </style>
 </head>
@@ -180,8 +195,8 @@
 <section>
   <h2>账号池</h2>
   <div class="toolbar">
-    <button id="toggle-login" class="btn primary" type="button">网页登录</button>
-    <button id="toggle-add" class="btn" type="button">手动添加账号</button>
+    <button id="toggle-login" class="btn" type="button" aria-expanded="false" aria-controls="login-box">网页登录</button>
+    <button id="toggle-add" class="btn" type="button" aria-expanded="false" aria-controls="add-account-form">手动添加账号</button>
     <span id="accounts-msg" class="form-msg"></span>
   </div>
   <div id="login-box" class="login-box" hidden>
@@ -197,8 +212,8 @@
     <input id="login-callback" type="text" autocomplete="off" placeholder="office-raccoon://auth/callback?code=…&state=…">
     <div class="row">
       <button id="login-submit" class="btn primary" type="button">完成登录</button>
-      <span id="login-msg" class="form-msg"></span>
     </div>
+    <div id="login-msg" class="form-msg"></div>
   </div>
   <form id="add-account-form" class="add-form" hidden>
     <div class="field">
@@ -207,7 +222,7 @@
     </div>
     <div class="field wide">
       <label for="new-access">access_token（必填）</label>
-      <textarea id="new-access" rows="3" autocomplete="off"></textarea>
+      <textarea id="new-access" rows="2" autocomplete="off"></textarea>
     </div>
     <div class="field wide">
       <label for="new-refresh">refresh_token</label>
@@ -423,7 +438,8 @@
       var login = s.login || {};
       loginEnabled = login.enabled !== false;
       document.getElementById("toggle-login").hidden = !loginEnabled;
-      if (!loginEnabled) document.getElementById("login-box").hidden = true;
+      // 登录被禁用时收起登录块；不碰「手动添加账号」的折叠状态（SPEC6 §N2）。
+      if (!loginEnabled) setPanel("login-box", false);
       return true;
     });
   }
@@ -524,19 +540,61 @@
     });
   }
 
+  // ── 2a. 折叠开关：两块互斥，默认都收起（SPEC6 §N1） ──
+  // 用 hidden 属性控制显隐（CSS 对 [hidden] 做了兜底），并同步 .active / aria-expanded。
+  var PANELS = [
+    { btn: "toggle-login", body: "login-box" },
+    { btn: "toggle-add", body: "add-account-form" }
+  ];
+
+  function panelOpen(bodyId) {
+    var el = document.getElementById(bodyId);
+    return !!el && !el.hidden;
+  }
+
+  function syncPanelButton(bodyId) {
+    for (var i = 0; i < PANELS.length; i++) {
+      if (PANELS[i].body !== bodyId) continue;
+      var body = document.getElementById(bodyId);
+      var btn = document.getElementById(PANELS[i].btn);
+      var open = !!body && !body.hidden;
+      btn.classList.toggle("active", open);
+      btn.setAttribute("aria-expanded", open ? "true" : "false");
+      return;
+    }
+  }
+
+  function setPanel(bodyId, open) {
+    var body = document.getElementById(bodyId);
+    if (!body) return;
+    body.hidden = !open;
+    syncPanelButton(bodyId);
+  }
+
+  function closeOtherPanels(bodyId) {
+    for (var i = 0; i < PANELS.length; i++) {
+      if (PANELS[i].body !== bodyId) setPanel(PANELS[i].body, false);
+    }
+  }
+
   // ── 2b. 新增账号表单 ──
   (function wireAddForm() {
     var form = document.getElementById("add-account-form");
     var msg = document.getElementById("add-msg");
     document.getElementById("toggle-add").addEventListener("click", function () {
-      form.hidden = !form.hidden;
+      if (panelOpen("add-account-form")) {
+        setPanel("add-account-form", false);
+      } else {
+        closeOtherPanels("add-account-form");
+        setPanel("add-account-form", true);
+      }
       if (form.hidden) {
         msg.textContent = "";
         msg.className = "form-msg wide";
       }
     });
     document.getElementById("cancel-add").addEventListener("click", function () {
-      form.hidden = true;
+      setPanel("add-account-form", false);
       msg.textContent = "";
       msg.className = "form-msg wide";
     });
@@ -592,7 +650,6 @@
   }
 
   (function wireLogin() {
-    var box = document.getElementById("login-box");
     var link = document.getElementById("login-link");
     var ttlEl = document.getElementById("login-ttl");
     var input = document.getElementById("login-callback");
@@ -600,7 +657,7 @@
     var submit = document.getElementById("login-submit");
 
     document.getElementById("toggle-login").addEventListener("click", function () {
-      if (!box.hidden) { box.hidden = true; return; }
+      if (panelOpen("login-box")) { setPanel("login-box", false); return; }
       var btn = document.getElementById("toggle-login");
       btn.disabled = true;
       showLoginMsg("");
@@ -609,7 +666,8 @@
           var url = (res && res.url) || "";
           link.setAttribute("href", url);
           ttlEl.textContent = fmtTtl(res && res.ttl_seconds);
-          box.hidden = false;
+          closeOtherPanels("login-box");
+          setPanel("login-box", true);
         })
         .catch(function (err) { showAccountsMsg(err.message, true); })
         .then(function () { btn.disabled = false; });
@@ -636,7 +694,7 @@
       showLoginMsg("登录中…", false);
       writeJSON("POST", "/admin/api/login/exchange", { callback_url: value })
         .then(function (res) {
-          box.hidden = true;
+          setPanel("login-box", false);
           input.value = "";
           showLoginMsg("");
           showAccountsMsg("登录成功：" + ((res && res.id) || ""), false);
