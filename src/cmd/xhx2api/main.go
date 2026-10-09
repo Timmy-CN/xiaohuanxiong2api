@@ -71,7 +71,7 @@ func main() {
 		RefreshOn401:         cfg.Accounts.RefreshOn401Value(),
 	}, client, logger)
 
-	catalog := server.NewCatalog(client, cfg.Models.CatalogCacheTTL(), cfg.Models.CatalogCacheFileValue(), cfg.Models.Fallback)
+	catalog := server.NewCatalog(client, cfg.Models.CatalogCacheTTL(), cfg.Models.CatalogCacheFileValue())
 	catalog.LoadCache()
 	if err := catalog.Refresh(context.Background(), accountPool.FirstToken()); err != nil {
 		logger.Warnf("[catalog] 远程目录拉取失败（沿用 %s）：%v", catalog.Source(), err)

@@ -106,6 +106,38 @@
   .wallets .w b { color: var(--text); font-weight: 600; }
   .card .err { color: var(--err); font-size: 12px; margin-top: 8px; word-break: break-all; }
   .card .sub { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  button.btn {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font: inherit; cursor: pointer;
+  }
+  button.btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button.btn:disabled { opacity: .5; cursor: not-allowed; }
+  button.btn.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err); }
+  .add-form {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 10px 14px; background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px;
+  }
+  .add-form .field { display: flex; flex-direction: column; gap: 4px; }
+  .add-form .wide { grid-column: 1 / -1; }
+  .add-form label { color: var(--muted); font-size: 12px; }
+  .add-form input, .add-form textarea {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%;
+  }
+  .add-form textarea { resize: vertical; }
+  .add-form .actions { flex-direction: row; align-items: center; gap: 8px; }
+  .add-form .check { flex-direction: row; align-items: center; gap: 8px; }
+  .add-form .check input { width: auto; }
+  .form-msg { font-size: 12px; }
+  .form-msg.err { color: var(--err); }
+  .form-msg.ok { color: var(--ok); }
+  .test-result { font-size: 12px; color: var(--muted); }
+  .test-result.ok { color: var(--ok); }
+  .test-result.err { color: var(--err); }
+  td.actions-cell { white-space: nowrap; }
+  td.actions-cell .btn { margin-right: 4px; }
   @media (max-width: 720px) {
     body { padding: 10px; }
     .topbar { gap: 8px 16px; }
@@ -130,11 +162,42 @@
 
 <section>
   <h2>账号池</h2>
+  <div class="toolbar">
+    <button id="toggle-add" class="btn" type="button">新增账号</button>
+    <span id="accounts-msg" class="form-msg"></span>
+  </div>
+  <form id="add-account-form" class="add-form" hidden>
+    <div class="field">
+      <label for="new-name">名称</label>
+      <input id="new-name" type="text" autocomplete="off">
+    </div>
+    <div class="field wide">
+      <label for="new-access">access_token（必填）</label>
+      <textarea id="new-access" rows="3" autocomplete="off"></textarea>
+    </div>
+    <div class="field wide">
+      <label for="new-refresh">refresh_token</label>
+      <textarea id="new-refresh" rows="2" autocomplete="off"></textarea>
+    </div>
+    <div class="field">
+      <label for="new-priority">priority</label>
+      <input id="new-priority" type="number" value="100">
+    </div>
+    <div class="field check">
+      <label for="new-enabled">启用</label>
+      <input id="new-enabled" type="checkbox" checked>
+    </div>
+    <div class="field actions">
+      <button id="submit-add" class="btn" type="submit">保存</button>
+      <button id="cancel-add" class="btn" type="button">取消</button>
+    </div>
+    <div id="add-msg" class="form-msg wide"></div>
+  </form>
   <div class="scroll">
     <table>
       <thead><tr>
         <th>ID</th><th>名称</th><th>启用</th><th>Token 尾号</th><th>过期时间</th>
-        <th>剩余</th><th>冷却中</th><th>上次刷新</th><th>最近错误</th>
+        <th>剩余</th><th>冷却中</th><th>上次刷新</th><th>最近错误</th><th>测试结果</th><th>操作</th>
       </tr></thead>
       <tbody id="accounts-body"></tbody>
     </table>
@@ -200,6 +263,32 @@
     return fetch(api(path), { headers: { "Accept": "application/json" } }).then(function (r) {
       if (!r.ok) throw new Error("HTTP " + r.status);
       return r.json();
+    });
+  }
+
+  // 写请求：统一走 api(path) 自动带 ?key=，错误时抛出接口返回的中文 message。
+  function writeJSON(method, path, body) {
+    var opts = {
+      method: method,
+      headers: { "Content-Type": "application/json" }
+    };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    return fetch(api(path), opts).then(function (r) {
+      return r.text().then(function (text) {
+        var parsed = null;
+        if (text) {
+          try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+        }
+        if (!r.ok) {
+          var message = parsed && parsed.error && parsed.error.message
+            ? parsed.error.message
+            : "HTTP " + r.status;
+          var err = new Error(message);
+          err.status = r.status;
+          throw err;
+        }
+        return parsed;
+      });
     });
   }
 
@@ -302,11 +391,82 @@
   }
 
   // ── 2. 账号池表 ──
+  function showAccountsMsg(msg, isErr) {
+    var el = document.getElementById("accounts-msg");
+    el.textContent = msg || "";
+    el.className = "form-msg " + (isErr ? "err" : "ok");
+  }
+
+  function actionButton(label, cls, onClick) {
+    var btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn" + (cls ? " " + cls : "");
+    btn.textContent = label;
+    btn.addEventListener("click", onClick);
+    return btn;
+  }
+
+  function accountPath(id) {
+    return "/admin/api/accounts/" + encodeURIComponent(id);
+  }
+
   function loadAccounts() {
     return getJSON("/admin/api/accounts").then(function (list) {
       var rows = [];
       (list || []).forEach(function (a) {
         var cooldown = a.cooldown_until && a.cooldown_until > Date.now();
+
+        var testCell = document.createElement("td");
+        var testSpan = document.createElement("span");
+        testSpan.className = "test-result";
+        testSpan.textContent = "—";
+        testCell.appendChild(testSpan);
+
+        var actions = document.createElement("td");
+        actions.className = "actions-cell";
+
+        var toggle = actionButton(a.enabled ? "禁用" : "启用", "", function () {
+          toggle.disabled = true;
+          writeJSON("PATCH", accountPath(a.id), { enabled: !a.enabled })
+            .then(function () { showAccountsMsg(""); return loadAccounts(); })
+            .catch(function (err) { showAccountsMsg(err.message, true); })
+            .then(function () { toggle.disabled = false; });
+        });
+
+        var del = actionButton("删除", "danger", function () {
+          if (!window.confirm("确认删除账号 " + a.id + "？")) return;
+          del.disabled = true;
+          writeJSON("DELETE", accountPath(a.id))
+            .then(function () { showAccountsMsg(""); return loadAccounts(); })
+            .catch(function (err) { showAccountsMsg(err.message, true); })
+            .then(function () { del.disabled = false; });
+        });
+
+        var test = actionButton("测试", "", function () {
+          test.disabled = true;
+          testSpan.textContent = "测试中…";
+          testSpan.className = "test-result";
+          writeJSON("POST", accountPath(a.id) + "/test")
+            .then(function (res) {
+              if (res && res.ok) {
+                testSpan.textContent = "✓ " + res.status + " / " + res.models + " 个模型";
+                testSpan.className = "test-result ok";
+              } else {
+                testSpan.textContent = "✗ " + ((res && res.status) || 0) + " " + ((res && res.error) || "");
+                testSpan.className = "test-result err";
+              }
+            })
+            .catch(function (err) {
+              testSpan.textContent = "✗ " + err.message;
+              testSpan.className = "test-result err";
+            })
+            .then(function () { test.disabled = false; });
+        });
+
+        actions.appendChild(toggle);
+        actions.appendChild(del);
+        actions.appendChild(test);
+
         rows.push(row([
           td(a.id),
           td(a.name),
@@ -316,13 +476,66 @@
           td(fmtRemain(a.expires_in_seconds), "num"),
           tdBadge(cooldown ? "冷却中" : "否", cooldown ? "b-warn" : "b-off"),
           td(fmtTime(a.last_refresh_at)),
-          td(a.last_error)
+          td(a.last_error),
+          testCell,
+          actions
         ]));
       });
-      setBody("accounts-body", rows.length ? rows : [emptyRow(9, "暂无账号")]);
+      setBody("accounts-body", rows.length ? rows : [emptyRow(11, "暂无账号")]);
       return true;
     });
   }
+
+  // ── 2b. 新增账号表单 ──
+  (function wireAddForm() {
+    var form = document.getElementById("add-account-form");
+    var msg = document.getElementById("add-msg");
+    document.getElementById("toggle-add").addEventListener("click", function () {
+      form.hidden = !form.hidden;
+      if (form.hidden) {
+        msg.textContent = "";
+        msg.className = "form-msg wide";
+      }
+    });
+    document.getElementById("cancel-add").addEventListener("click", function () {
+      form.hidden = true;
+      msg.textContent = "";
+      msg.className = "form-msg wide";
+    });
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var submit = document.getElementById("submit-add");
+      var payload = {
+        name: document.getElementById("new-name").value,
+        access_token: document.getElementById("new-access").value,
+        refresh_token: document.getElementById("new-refresh").value,
+        priority: Number(document.getElementById("new-priority").value),
+        enabled: document.getElementById("new-enabled").checked
+      };
+      if (!payload.access_token) {
+        msg.textContent = "access_token 不能为空";
+        msg.className = "form-msg wide err";
+        return;
+      }
+      submit.disabled = true;
+      msg.textContent = "";
+      msg.className = "form-msg wide";
+      writeJSON("POST", "/admin/api/accounts", payload)
+        .then(function () {
+          form.reset();
+          document.getElementById("new-priority").value = "100";
+          document.getElementById("new-enabled").checked = true;
+          msg.textContent = "新增成功";
+          msg.className = "form-msg wide ok";
+          return loadAccounts();
+        })
+        .catch(function (err) {
+          msg.textContent = err.message;
+          msg.className = "form-msg wide err";
+        })
+        .then(function () { submit.disabled = false; });
+    });
+  })();
 
   // ── 3. 积分卡 ──
   function loadBalance() {
@@ -420,7 +633,7 @@
     });
   }
 
-  // ── 5. 模型目录表（别名单独一行标注）──
+  // ── 5. 模型目录表 ──
   function loadModels() {
     return getJSON("/admin/api/models").then(function (payload) {
       var rows = [];
@@ -433,15 +646,6 @@
           td(m.max_output_tokens, "num"),
           td(m.credits),
           tdBadge(m.visible ? "可见" : "隐藏", m.visible ? "b-ok" : "b-off")
-        ]));
-      });
-      var aliases = (payload && payload.aliases) || {};
-      Object.keys(aliases).sort().forEach(function (alias) {
-        rows.push(row([
-          td(alias),
-          td("→ " + aliases[alias]),
-          tdBadge("别名", "b-info"),
-          td("—"), td("—"), td("—"), td("—")
         ]));
       });
       setBody("models-body", rows.length ? rows : [emptyRow(7, "暂无模型")]);

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,33 +16,26 @@ import (
 
 // Catalog 是模型目录的内存状态 + 持久化缓存（SPEC §6.2）。
 //
-// 来源优先级：内存缓存（TTL 内）→ 持久化缓存文件 → 配置 fallback → 内置 §1.2。
-// 任何情况下 Models() 都返回非空内容。
+// 来源优先级：内存缓存（TTL 内）→ 持久化缓存文件 → 空（source=empty）。
 type Catalog struct {
 	mu          sync.Mutex
 	models      []upstream.Model
-	source      string // remote | cache | fallback
+	source      string // remote | cache | empty
 	refreshedAt int64  // 毫秒
 	nextRefresh time.Time
 	inFlight    bool
 
 	ttl       time.Duration
 	cacheFile string
-	fallback  []upstream.Model
 	client    *upstream.Client
 }
 
-// NewCatalog 构造目录；fallback 为空时使用内置 9 条。
-func NewCatalog(client *upstream.Client, ttl time.Duration, cacheFile string, fallback []upstream.Model) *Catalog {
-	if len(fallback) == 0 {
-		fallback = upstream.BuiltinModels()
-	}
+// NewCatalog 构造目录；初始为空（等待 LoadCache 或 Refresh）。
+func NewCatalog(client *upstream.Client, ttl time.Duration, cacheFile string) *Catalog {
 	return &Catalog{
-		source:    "fallback",
-		models:    fallback,
+		source:    "empty",
 		ttl:       ttl,
 		cacheFile: cacheFile,
-		fallback:  fallback,
 		client:    client,
 	}
 }
@@ -53,7 +45,7 @@ type catalogCacheFile struct {
 	RefreshedAt int64            `json:"refreshed_at"`
 }
 
-// LoadCache 从持久化缓存文件恢复目录（没有则保持 fallback）。
+// LoadCache 从持久化缓存文件恢复目录（没有则保持空）。
 func (c *Catalog) LoadCache() bool {
 	if c.cacheFile == "" {
 		return false
@@ -134,15 +126,12 @@ func (c *Catalog) refreshAsync(token string) {
 	}()
 }
 
-// Models 返回当前目录（非空）。
+// Models 返回当前目录（可能为空）。
 func (c *Catalog) Models(token string) []upstream.Model {
 	c.mu.Lock()
 	models := c.models
 	c.mu.Unlock()
 	c.refreshAsync(token)
-	if len(models) == 0 {
-		return c.fallback
-	}
 	return models
 }
 
@@ -183,7 +172,7 @@ func (c *Catalog) RefreshedAt() int64 {
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	models := s.catalog.Models(s.pool.FirstToken())
 	created := s.startedAt.Unix()
-	data := make([]map[string]any, 0, len(models)+len(s.cfg.Models.Aliases))
+	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
 		entry := map[string]any{
 			"id":           model.ID,
@@ -200,21 +189,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			entry["max_output_tokens"] = *model.MaxOutputTokens
 		}
 		data = append(data, entry)
-	}
-	aliases := make([]string, 0, len(s.cfg.Models.Aliases))
-	for alias := range s.cfg.Models.Aliases {
-		aliases = append(aliases, alias)
-	}
-	sort.Strings(aliases)
-	for _, alias := range aliases {
-		data = append(data, map[string]any{
-			"id":           alias,
-			"object":       "model",
-			"created":      created,
-			"owned_by":     "alias",
-			"display_name": alias,
-			"credits":      "",
-		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }

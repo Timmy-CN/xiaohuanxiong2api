@@ -38,6 +38,45 @@ func JWTExpiry(token string) int64 {
 	return int64(seconds * 1000)
 }
 
+// JWTUserID 解码 JWT payload 里的用户 id（不验签）。
+//
+// 依次尝试 user_id / userId / uid / userID；解析不出返回空串（SPEC4 §G.2）。
+func JWTUserID(token string) string {
+	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return ""
+		}
+	}
+	var claims map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	for _, key := range []string{"user_id", "userId", "uid", "userID"} {
+		raw, ok := claims[key]
+		if !ok {
+			continue
+		}
+		var text string
+		if err := json.Unmarshal(raw, &text); err == nil && text != "" {
+			return text
+		}
+		var num json.Number
+		if err := json.Unmarshal(raw, &num); err == nil {
+			if s := num.String(); s != "" && s != "0" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 // TokenTail 返回 token 的最后 4 个字符（不足则整体返回）。
 func TokenTail(token string) string {
 	runes := []rune(token)

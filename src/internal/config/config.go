@@ -19,8 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"xhx2api/internal/upstream"
 )
 
 // 默认值常量（集中在此，便于测试引用）。
@@ -39,7 +37,7 @@ const (
 	DefaultBillsTimeout           = 25
 	DefaultUserAgent              = "xhx2api/0.1.0"
 	DefaultAccountsFile           = "./data/accounts.json"
-	DefaultStrategy               = "priority"
+	DefaultStrategy               = "round_robin"
 	DefaultRefreshMarginSeconds   = 300
 	DefaultCooldownSeconds        = 600
 	DefaultMaxAttempts            = 3
@@ -110,12 +108,10 @@ type AccountsConfig struct {
 
 // ModelsConfig 是模型目录配置（SPEC §3.2 / §6.2）。
 type ModelsConfig struct {
-	Default             *string           `json:"default"`
-	Aliases             map[string]string `json:"aliases"`
-	Validate            *string           `json:"validate"`
-	CatalogCacheSeconds *int              `json:"catalog_cache_seconds"`
-	CatalogCacheFile    *string           `json:"catalog_cache_file"`
-	Fallback            []upstream.Model  `json:"fallback"`
+	Default             *string `json:"default"`
+	Validate            *string `json:"validate"`
+	CatalogCacheSeconds *int    `json:"catalog_cache_seconds"`
+	CatalogCacheFile    *string `json:"catalog_cache_file"`
 }
 
 // LogConfig 是日志配置（SPEC §3.2 / §6.4）。
@@ -242,9 +238,6 @@ func (c *Config) applyDefaults() {
 	a.RefreshOn401 = boolPtr(a.RefreshOn401, DefaultRefreshOn401)
 	m := &c.Models
 	m.Default = strPtr(m.Default, DefaultModel)
-	if m.Aliases == nil {
-		m.Aliases = map[string]string{}
-	}
 	m.Validate = strPtr(m.Validate, DefaultValidate)
 	m.CatalogCacheSeconds = intPtr(m.CatalogCacheSeconds, DefaultCatalogCacheSeconds)
 	m.CatalogCacheFile = strPtr(m.CatalogCacheFile, DefaultCatalogCacheFile)
@@ -356,11 +349,6 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(*c.Models.Default) == "" {
 		return errors.New("models.default 不能为空")
-	}
-	for key := range c.Models.Aliases {
-		if strings.TrimSpace(key) == "" {
-			return errors.New("models.aliases 的键不能为空")
-		}
 	}
 	return nil
 }

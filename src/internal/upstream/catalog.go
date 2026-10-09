@@ -54,7 +54,31 @@ func (c *Client) FetchCatalog(ctx context.Context, token string) ([]Model, error
 	if status < 200 || status >= 300 {
 		return nil, fmt.Errorf("拉取模型目录失败: HTTP %d: %s", status, jsonMessage(data))
 	}
+	return parseCatalog(data)
+}
 
+// CatalogProbe 只读地拉一次模型目录，返回上游 HTTP 状态码与解析出的模型条数。
+//
+// 不刷新 token、不写回（SPEC4 §G.2 的账号「测试」用）。上游非 2xx 时仍返回真实状态码。
+func (c *Client) CatalogProbe(ctx context.Context, token string) (int, int, error) {
+	url := c.opts.LLMBase + "/model_catalog"
+	status, data, err := c.doJSON(ctx, http.MethodGet, url, nil, token,
+		map[string]string{"Accept": "application/json"}, c.opts.CatalogTimeout, maxCatalogBytes)
+	if err != nil {
+		return 0, 0, fmt.Errorf("拉取模型目录失败: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return status, 0, fmt.Errorf("HTTP %d: %s", status, jsonMessage(data))
+	}
+	models, err := parseCatalog(data)
+	if err != nil {
+		return status, 0, err
+	}
+	return status, len(models), nil
+}
+
+// parseCatalog 把上游目录响应体解析成归一化后的模型列表。
+func parseCatalog(data []byte) ([]Model, error) {
 	var probe struct {
 		Code       *int            `json:"code"`
 		Message    string          `json:"message"`
@@ -166,122 +190,4 @@ func truncateRunes(s string, n int) string {
 		return s
 	}
 	return string(runes[:n])
-}
-
-func floatPtr(v float64) *float64 { return &v }
-
-func int64Ptr(v int64) *int64 { return &v }
-
-// BuiltinModels 返回 SPEC §1.2 实测的 9 条静态兜底模型。
-//
-// 这是 `models.fallback` 为空时的兜底内容：任何情况下 /v1/models 都必须有内容。
-func BuiltinModels() []Model {
-	generalOffice := []string{"general", "office", "code", "vision", "debug", "analysis", "html", "reasoning", "auto"}
-	officeAnalysis := []string{"general", "office", "code", "analysis", "auto"}
-	chatLight := []string{"general", "chat", "rewrite", "summary", "fast"}
-	chatLightVision := []string{"general", "chat", "rewrite", "summary", "fast", "vision"}
-	officeNoAuto := []string{"general", "office", "code", "vision", "debug", "analysis", "html", "reasoning"}
-	codeAnalysis := []string{"general", "code", "html", "analysis", "reasoning", "auto"}
-
-	return []Model{
-		{
-			ID:                         "raccoon-8c4485",
-			DisplayName:                "适合复杂办公任务、代码开发、调试和图像识别等任务",
-			Description:                "适合复杂办公任务、代码开发、调试和图像识别等任务",
-			Tags:                       generalOffice,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(1),
-			BillingEffectiveMultiplier: floatPtr(1),
-			Visible:                    false,
-		},
-		{
-			ID:                         "raccoon-19b265",
-			DisplayName:                "适合复杂办公任务、代码开发和综合分析等任务",
-			Description:                "适合复杂办公任务、代码开发和综合分析等任务",
-			Tags:                       officeAnalysis,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(1),
-			BillingEffectiveMultiplier: floatPtr(1),
-			Visible:                    false,
-		},
-		{
-			ID:                         "raccoon-405a1c",
-			DisplayName:                "适合通用对话、轻量代码和内容处理等任务",
-			Description:                "适合通用对话、轻量代码和内容处理等任务",
-			Tags:                       chatLight,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(1),
-			BillingEffectiveMultiplier: floatPtr(1),
-			Visible:                    false,
-		},
-		{
-			ID:                         "sn-sensenova-6-8-flash",
-			DisplayName:                "适合简单问答、内容改写和摘要等轻量任务",
-			Description:                "适合简单问答、内容改写和摘要等轻量任务",
-			Tags:                       chatLightVision,
-			MaxInputTokens:             int64Ptr(256000),
-			MaxOutputTokens:            int64Ptr(63999),
-			BillingMultiplier:          floatPtr(0.5),
-			BillingEffectiveMultiplier: floatPtr(0),
-			Visible:                    true,
-		},
-		{
-			ID:                         "sn-sensenova-6-8-flash-lite",
-			DisplayName:                "适合简单问答、内容改写和摘要等轻量任务",
-			Description:                "适合简单问答、内容改写和摘要等轻量任务",
-			Tags:                       chatLightVision,
-			MaxInputTokens:             int64Ptr(256000),
-			MaxOutputTokens:            int64Ptr(63999),
-			BillingMultiplier:          floatPtr(0.5),
-			BillingEffectiveMultiplier: floatPtr(0),
-			Visible:                    true,
-		},
-		{
-			ID:                         "sn-glm-5-3",
-			DisplayName:                "适合复杂办公任务、代码开发、调试和图像识别等任务",
-			Description:                "适合复杂办公任务、代码开发、调试和图像识别等任务",
-			Tags:                       officeNoAuto,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(0.75),
-			BillingEffectiveMultiplier: floatPtr(0.75),
-			Visible:                    true,
-		},
-		{
-			ID:                         "sn-kimi-k3",
-			DisplayName:                "适合复杂办公任务、代码开发和综合分析等任务",
-			Description:                "适合复杂办公任务、代码开发和综合分析等任务",
-			Tags:                       officeNoAuto,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(1),
-			BillingEffectiveMultiplier: floatPtr(1),
-			Visible:                    true,
-		},
-		{
-			ID:                         "sn-glm-5-3-flash",
-			DisplayName:                "适合通用对话、轻量代码和内容处理等任务",
-			Description:                "适合通用对话、轻量代码和内容处理等任务",
-			Tags:                       chatLight,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(0.2),
-			BillingEffectiveMultiplier: floatPtr(0.2),
-			Visible:                    true,
-		},
-		{
-			ID:                         "sn-deepseek-v4-1-flash",
-			DisplayName:                "适合通用代码开发、复杂分析和推理任务",
-			Description:                "适合通用代码开发、复杂分析和推理任务",
-			Tags:                       codeAnalysis,
-			MaxInputTokens:             int64Ptr(1000000),
-			MaxOutputTokens:            int64Ptr(100000),
-			BillingMultiplier:          floatPtr(0.25),
-			BillingEffectiveMultiplier: floatPtr(0.25),
-			Visible:                    true,
-		},
-	}
 }

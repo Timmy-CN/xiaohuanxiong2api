@@ -19,7 +19,7 @@
   },
   "accounts": {
     "file": "./data/accounts.json",
-    "strategy": "priority",            // priority | round_robin
+    "strategy": "round_robin",         // priority | round_robin（默认 round_robin）
     "refresh_margin_seconds": 300,     // 过期前多久主动刷新
     "cooldown_seconds": 600,           // 429/5xx 后该账号冷却时长
     "max_attempts": 3,                 // 一次客户端请求最多尝试几个账号
@@ -27,16 +27,9 @@
   },
   "models": {
     "default": "sn-glm-5-3-flash",     // 请求没给 model 时用它
-    "aliases": {                       // 对外别名 → 上游模型 id
-      "glm-5.3-flash": "sn-glm-5-3-flash",
-      "glm-5.3": "sn-glm-5-3",
-      "glm-5-3-flash": "sn-glm-5-3-flash",
-      "glm-5-3": "sn-glm-5-3"
-    },
     "validate": "catalog",             // none = 不校验，原样透传；catalog = 不在目录里则 400
     "catalog_cache_seconds": 600,
-    "catalog_cache_file": "./data/model_catalog.json",
-    "fallback": []                     // 空 = 用代码内置的 §1.2 那 9 条；非空则完全用它
+    "catalog_cache_file": "./data/model_catalog.json"
   },
   "log": {
     "level": "info",                   // debug | info | warn | error

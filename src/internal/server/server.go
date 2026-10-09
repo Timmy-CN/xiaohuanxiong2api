@@ -56,6 +56,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /admin", s.adminAuth(http.HandlerFunc(s.handleAdminPage)))
 	mux.Handle("GET /admin/", s.adminAuth(http.HandlerFunc(s.handleAdminPage)))
 	mux.Handle("GET /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
+	mux.Handle("POST /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
+	mux.Handle("PATCH /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
+	mux.Handle("DELETE /admin/api/", s.adminAuth(http.HandlerFunc(s.handleAdminAPI)))
 	return mux
 }
 

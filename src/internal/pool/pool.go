@@ -8,6 +8,7 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,6 +17,14 @@ import (
 
 	"xhx2api/internal/logx"
 	"xhx2api/internal/upstream"
+)
+
+// 账号池写操作错误（SPEC4 §G.2）。
+var (
+	// ErrAccountExists 表示要新增的账号 id 已存在。
+	ErrAccountExists = errors.New("账号 id 已存在")
+	// ErrAccountNotFound 表示账号不存在。
+	ErrAccountNotFound = errors.New("账号不存在")
 )
 
 // Account 是账号文件里的一条账号记录。
@@ -156,8 +165,8 @@ func (p *Pool) load() {
 // persist 把账号池原子写回文件（临时文件 + rename，权限 0600）。
 //
 // 快照在 mu 内完成（只做序列化，无 IO），文件写入在锁外完成；
-// 写失败只记日志，不影响本次请求（SPEC §5.1）。
-func (p *Pool) persist() {
+// 返回错误供写接口判断（SPEC4 §G.2），现有调用点可忽略返回值。
+func (p *Pool) persist() error {
 	p.persistMu.Lock()
 	defer p.persistMu.Unlock()
 
@@ -169,7 +178,7 @@ func (p *Pool) persist() {
 	p.mu.Unlock()
 	if err != nil {
 		p.logger.Warnf("[pool] 警告：序列化账号文件失败：%v", err)
-		return
+		return fmt.Errorf("序列化账号文件失败：%v", err)
 	}
 	data = append(data, '\n')
 
@@ -177,25 +186,25 @@ func (p *Pool) persist() {
 	if dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			p.logger.Warnf("[pool] 警告：创建账号目录失败（%s）：%v", dir, err)
-			return
+			return fmt.Errorf("创建账号目录失败：%v", err)
 		}
 	}
 	tmp, err := os.CreateTemp(dir, ".accounts-*.tmp")
 	if err != nil {
 		p.logger.Warnf("[pool] 警告：创建临时账号文件失败：%v", err)
-		return
+		return fmt.Errorf("创建临时账号文件失败：%v", err)
 	}
 	tmpName := tmp.Name()
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		os.Remove(tmpName)
 		p.logger.Warnf("[pool] 警告：写入临时账号文件失败：%v", err)
-		return
+		return fmt.Errorf("写入临时账号文件失败：%v", err)
 	}
 	if err := tmp.Close(); err != nil {
 		os.Remove(tmpName)
 		p.logger.Warnf("[pool] 警告：关闭临时账号文件失败：%v", err)
-		return
+		return fmt.Errorf("关闭临时账号文件失败：%v", err)
 	}
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		p.logger.Warnf("[pool] 警告：设置账号文件权限失败：%v", err)
@@ -203,7 +212,9 @@ func (p *Pool) persist() {
 	if err := os.Rename(tmpName, p.cfg.File); err != nil {
 		os.Remove(tmpName)
 		p.logger.Warnf("[pool] 警告：替换账号文件失败：%v", err)
+		return fmt.Errorf("替换账号文件失败：%v", err)
 	}
+	return nil
 }
 
 func (p *Pool) findLocked(id string) *Account {
@@ -401,6 +412,28 @@ type AccountView struct {
 	HasRefreshToken  bool   `json:"has_refresh_token"`
 }
 
+// viewOf 由账号构造只读快照（Views / View / 写接口响应复用同一份）。
+func viewOf(account *Account, now int64) AccountView {
+	view := AccountView{
+		ID:              account.ID,
+		Name:            account.Name,
+		UserID:          account.UserID,
+		Enabled:         account.Enabled,
+		Priority:        account.Priority,
+		TokenTail:       upstream.TokenTail(account.AccessToken),
+		ExpiresAt:       account.ExpiresAt,
+		CooldownUntil:   account.CooldownUntil,
+		LastRefreshAt:   account.LastRefreshAt,
+		LastError:       account.LastError,
+		HasRefreshToken: account.RefreshToken != "",
+	}
+	if account.ExpiresAt > 0 {
+		view.ExpiresInSeconds = (account.ExpiresAt - now) / 1000
+		view.Expired = account.ExpiresAt <= now
+	}
+	return view
+}
+
 // Views 返回全部账号的只读快照。
 func (p *Pool) Views() []AccountView {
 	p.mu.Lock()
@@ -408,26 +441,112 @@ func (p *Pool) Views() []AccountView {
 	now := time.Now().UnixMilli()
 	views := make([]AccountView, 0, len(p.accounts))
 	for _, account := range p.accounts {
-		view := AccountView{
-			ID:              account.ID,
-			Name:            account.Name,
-			UserID:          account.UserID,
-			Enabled:         account.Enabled,
-			Priority:        account.Priority,
-			TokenTail:       upstream.TokenTail(account.AccessToken),
-			ExpiresAt:       account.ExpiresAt,
-			CooldownUntil:   account.CooldownUntil,
-			LastRefreshAt:   account.LastRefreshAt,
-			LastError:       account.LastError,
-			HasRefreshToken: account.RefreshToken != "",
-		}
-		if account.ExpiresAt > 0 {
-			view.ExpiresInSeconds = (account.ExpiresAt - now) / 1000
-			view.Expired = account.ExpiresAt <= now
-		}
-		views = append(views, view)
+		views = append(views, viewOf(account, now))
 	}
 	return views
+}
+
+// View 返回单个账号的只读快照；不存在返回 false。
+func (p *Pool) View(id string) (AccountView, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.findLocked(id)
+	if account == nil {
+		return AccountView{}, false
+	}
+	return viewOf(account, time.Now().UnixMilli()), true
+}
+
+// AccountPatch 描述一次账号更新；nil 字段保持不变（SPEC4 §G.2）。
+type AccountPatch struct {
+	Name         *string
+	Priority     *int
+	Enabled      *bool
+	AccessToken  *string
+	RefreshToken *string
+}
+
+// Add 新增账号并原子回写；id 冲突返回 ErrAccountExists。持锁期间不写盘。
+func (p *Pool) Add(account *Account) error {
+	if account == nil {
+		return errors.New("账号为空")
+	}
+	p.mu.Lock()
+	if p.findLocked(account.ID) != nil {
+		p.mu.Unlock()
+		return ErrAccountExists
+	}
+	p.accounts = append(p.accounts, account.clone())
+	p.mu.Unlock()
+	return p.persist()
+}
+
+// Update 只改给出的字段并原子回写；账号不存在返回 ErrAccountNotFound。
+//
+// 更新 access_token 时同步重算 expires_at 与 user_id（SPEC4 §G.2）。
+func (p *Pool) Update(id string, patch AccountPatch) error {
+	p.mu.Lock()
+	account := p.findLocked(id)
+	if account == nil {
+		p.mu.Unlock()
+		return ErrAccountNotFound
+	}
+	if patch.Name != nil {
+		account.Name = *patch.Name
+	}
+	if patch.Priority != nil {
+		account.Priority = *patch.Priority
+	}
+	if patch.Enabled != nil {
+		account.Enabled = *patch.Enabled
+	}
+	if patch.RefreshToken != nil {
+		account.RefreshToken = *patch.RefreshToken
+	}
+	if patch.AccessToken != nil {
+		account.AccessToken = *patch.AccessToken
+		account.ExpiresAt = upstream.JWTExpiry(*patch.AccessToken)
+		account.UserID = upstream.JWTUserID(*patch.AccessToken)
+	}
+	p.mu.Unlock()
+	return p.persist()
+}
+
+// Remove 删除账号并原子回写；账号不存在返回 ErrAccountNotFound。
+func (p *Pool) Remove(id string) error {
+	p.mu.Lock()
+	index := -1
+	for i, account := range p.accounts {
+		if account.ID == id {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		p.mu.Unlock()
+		return ErrAccountNotFound
+	}
+	p.accounts = append(p.accounts[:index], p.accounts[index+1:]...)
+	p.mu.Unlock()
+	return p.persist()
+}
+
+// TestToken 用账号当前 token 只读地打一次上游目录，返回状态码与模型条数。
+//
+// 不刷新 token、不写回（SPEC4 §G.2）。账号不存在返回 ErrAccountNotFound。
+func (p *Pool) TestToken(ctx context.Context, id string) (int, int, error) {
+	p.mu.Lock()
+	account := p.findLocked(id)
+	if account == nil {
+		p.mu.Unlock()
+		return 0, 0, ErrAccountNotFound
+	}
+	token := account.AccessToken
+	p.mu.Unlock()
+	if token == "" {
+		return 0, 0, errors.New("账号没有可用 token")
+	}
+	return p.client.CatalogProbe(ctx, token)
 }
 
 // TokenFor 返回账号当前 token（不刷新），供只读查询使用；不存在返回空串。

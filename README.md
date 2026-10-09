@@ -81,9 +81,9 @@ curl -s http://127.0.0.1:3066/healthz
 # 模型列表（OpenAI 形状）
 curl -s http://127.0.0.1:3066/v1/models | head -c 400
 
-# 一条流式 chat（用别名 glm-5.3-flash）
+# 一条流式 chat（模型名直接用上游 id，如 sn-glm-5-3-flash）
 curl -sN -H 'Content-Type: application/json' \
-  -d '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"你好"}],"stream":true}' \
+  -d '{"model":"sn-glm-5-3-flash","messages":[{"role":"user","content":"你好"}],"stream":true}' \
   http://127.0.0.1:3066/v1/chat/completions
 
 # 浏览器打开管理面板
@@ -131,7 +131,7 @@ curl -sN -H 'Content-Type: application/json' \
 | 键 | 默认值 | 含义 |
 |---|---|---|
 | `file` | `"./data/accounts.json"` | 账号文件路径；不存在则空池启动（`/v1` 返回 503）。 |
-| `strategy` | `"priority"` | 选号策略：`priority`（按 priority 升序）或 `round_robin`（轮转）。 |
+| `strategy` | `"round_robin"` | 选号策略：`round_robin`（在可用账号间轮转，默认）或 `priority`（按 priority 升序，数值越小越优先）。 |
 | `refresh_margin_seconds` | `300` | 过期前多久主动刷新 token（秒）。 |
 | `cooldown_seconds` | `600` | 上游 429/5xx 后该账号的冷却时长（秒）。 |
 | `max_attempts` | `3` | 一次客户端请求最多尝试几个不同账号。 |
@@ -142,11 +142,12 @@ curl -sN -H 'Content-Type: application/json' \
 | 键 | 默认值 | 含义 |
 |---|---|---|
 | `default` | `"sn-glm-5-3-flash"` | 请求未给 `model` 时使用的模型 id。 |
-| `aliases` | `{"glm-5.3-flash":"sn-glm-5-3-flash","glm-5.3":"sn-glm-5-3","glm-5-3-flash":"sn-glm-5-3-flash","glm-5-3":"sn-glm-5-3"}` | 对外别名 → 上游模型 id 的映射。 |
-| `validate` | `"catalog"` | 模型校验：`none`（原样透传）或 `catalog`（不在目录里则 400）。 |
+| `validate` | `"catalog"` | 模型校验：`none`（原样透传）或 `catalog`（不在目录里则 400；目录为空时跳过校验、原样透传）。 |
 | `catalog_cache_seconds` | `600` | 目录内存缓存有效期（秒）。 |
 | `catalog_cache_file` | `"./data/model_catalog.json"` | 目录持久化缓存文件；远程拉不到时用它。 |
-| `fallback` | `[]` | 静态兜底模型；空 = 使用代码内置的 9 条，非空则完全用它。 |
+
+> 模型名一律用**上游 id**（`sn-glm-5-3-flash`、`sn-glm-5-3`、`sn-kimi-k3` 等），没有别名映射。
+> 目录来源优先级：内存（TTL 内）→ 持久化缓存文件 → 空（来源显示 `empty`，此时 `/v1/models` 返回空列表）。
 
 ### `log`
 
@@ -245,19 +246,20 @@ curl -sN -H 'Content-Type: application/json' \
 |---|---|---|---|
 | GET | `/healthz` | 无 | 健康检查：`{"status":"ok","version":…,"uptime_seconds":…,"accounts":{…},"models":…}`。 |
 | GET | `/favicon.ico` | 无 | 返回 204（在鉴权前短路）。 |
-| GET | `/v1/models` | `api_key` | OpenAI 模型列表（目录 + 别名）。 |
+| GET | `/v1/models` | `api_key` | OpenAI 模型列表（仅上游目录条目；目录为空时 `data` 为空数组）。 |
 | POST | `/v1/chat/completions` | `api_key` | 聊天补全，支持流式/非流式、思维链、function calling。 |
 | GET | `/admin`、`/admin/` | `admin.api_key` | 内嵌管理面板 HTML。 |
 | GET | `/admin/api/*` | `admin.api_key` | 只读 JSON 接口（见下）。 |
+| POST/PATCH/DELETE | `/admin/api/accounts…` | `admin.api_key` | 账号管理写接口（见「面板管理账号」）。 |
 
-`/admin/api/*` 均为只读 GET：
+`/admin/api/*` 的只读 GET：
 
 | 路径 | 返回 |
 |---|---|
 | `/admin/api/status` | 版本、启动时间、运行时长、监听地址、生效配置（密钥已掩码）、账号/模型统计。 |
 | `/admin/api/accounts` | 账号池快照（不含完整 token，只有尾 4 位）。 |
 | `/admin/api/accounts/balance` | 每账号积分与钱包明细（逐账号查上游，结果缓存 30 秒）。 |
-| `/admin/api/models` | 模型目录 + 别名映射。 |
+| `/admin/api/models` | 模型目录条目。 |
 | `/admin/api/requests?limit=N` | 最近 N 条请求日志（默认 100）。 |
 | `/admin/api/checkin` | 每账号的每日签到状态与历史。 |
 
@@ -267,11 +269,66 @@ curl -sN -H 'Content-Type: application/json' \
 
 浏览器打开 `http://<监听地址>/admin`（设置了 `admin.api_key` 时用 `/admin?key=<key>`）。
 
-- **只读**：面板只展示状态，不提供任何修改/操作功能。
+- 展示状态，并提供**账号管理**（新增 / 启用禁用 / 删除 / 测试）。
 - **每 5 秒自动刷新**一次；某次刷新失败时顶部显示「接口不可用」，但**不会清空**已展示的数据。
 - 自上而下包含六块：顶部状态条、账号池、积分卡、每日签到、模型目录、最近请求。
 - 页面为**单文件、零外部依赖**（无 CDN / 外部字体 / 图标），离线可用；暗色主题，窄屏可用（表格可横向滚动）。
-- 页面**不会**显示完整 `access_token` / `refresh_token` / `api_key`（接口本身也不返回）。
+- 页面**不会**显示完整 `access_token` / `refresh_token` / `api_key`（接口本身也不返回，只显示尾 4 位）。
+
+### 面板管理账号（写操作）
+
+> **前提：必须先在 `config.json` 里设置 `admin.api_key`。** 未设置时所有写操作返回 **403**，
+> 并提示「请先在 config.json 里设置 admin.api_key，再使用账号管理功能」。只读 GET 不受影响。
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST | `/admin/api/accounts` | 新增账号，body：`name` / `access_token`（必填）/ `refresh_token` / `priority`（默认 100）/ `enabled`（默认 true）。成功 201。 |
+| PATCH | `/admin/api/accounts/{id}` | 只改给出的字段：`name` / `priority` / `enabled` / `access_token` / `refresh_token`。成功 200。 |
+| DELETE | `/admin/api/accounts/{id}` | 删除账号。成功 200 `{"deleted":"<id>"}`。 |
+| POST | `/admin/api/accounts/{id}/test` | 用该账号当前 token 只读打一次上游目录，返回 `{"ok":true,"status":200,"models":<n>}`；上游失败也返回 HTTP 200，用 `{"ok":false,"status":<上游码>,"error":"…"}` 表达。 |
+
+- 鉴权沿用 `/admin/api/*`：`Authorization: Bearer <key>` 或 `?key=<key>`。
+- 新增时 `id` = `user-<userId>`（从 JWT 解析，不验签）；取不到 userId 时用 `acct-<8 位随机十六进制>`。
+- `expires_at` / `user_id` 从 JWT 解析；解析不出则 `expires_at = 0`（不主动刷新，靠 401 触发）、`user_id = ""`。
+- 每次写操作成功后**原子回写** `accounts.json`（临时文件 + rename、权限 `0600`、保留未知字段）。
+- 面板「账号池」表格的「操作」列即可启用/禁用、删除（二次确认）、测试；表格上方「新增账号」按钮展开表单。
+
+---
+
+## 挂进 CPA（CLIProxyAPI）
+
+本服务本身就是 OpenAI 兼容端点，在 CPA 里按 `openai-compatibility` 渠道挂即可，只需要三样东西：
+**base-url**、**api-key**（= 本服务 `config.json` 的 `api_key`）、**模型名**（就是上游 id，见 `/v1/models`；
+本服务**不做别名**）。
+
+```yaml
+# 追加到 /zfspool/data/ai/cpamp/cliproxyapi/config.yaml 顶层的 openai-compatibility: 列表里
+  - name: xhx2api
+    prefix: xhx
+    base-url: http://10.1.0.8:3066/v1
+    api-key-entries:
+      - api-key: <config.json 里的 api_key>
+    models:
+      - name: sn-glm-5-3-flash
+        alias: ""
+      - name: sn-glm-5-3
+        alias: ""
+      - name: sn-kimi-k3
+        alias: ""
+      - name: sn-deepseek-v4-1-flash
+        alias: ""
+      - name: sn-sensenova-6-8-flash
+        alias: ""
+      - name: sn-sensenova-6-8-flash-lite
+        alias: ""
+      # 可选（visible=false 的内部模型）：raccoon-8c4485 / raccoon-19b265 / raccoon-405a1c
+```
+
+- 读 api_key：`grep -o '"api_key": "[^"]*"' /zfspool/data/ai/xiaohuanxiong/config.json`
+- 生效：`ssh ai 'cd /zfspool/data/ai/cpamp && docker compose restart cli-proxy-api'`
+- 挂上后模型对外名带前缀（`xhx/sn-glm-5-3-flash`）。验证：
+  `curl -s -H "Authorization: Bearer <CPA key>" http://10.1.0.8:8317/v1/models | grep xhx`
+- 现成片段（含真实 api_key，放在不进 git 的 `data/` 下）：`data/cpa-provider-snippet.yaml`
 
 ---
 
@@ -309,9 +366,13 @@ curl -sN -H 'Content-Type: application/json' \
 - 面板「冷却中」列可看到状态。若频繁 429，降低请求频率或增加账号（`accounts.max_attempts` 决定一次请求最多换几个号）。
 
 **目录拉不到**
-- 不影响服务：会依次退回**持久化缓存** → **配置 fallback** → **内置 9 条**，`/v1/models` 永远有内容。
+- 不影响服务转发：会依次退回**持久化缓存文件** → **空**（来源显示 `empty`）。目录为空时 `/v1/models` 返回空列表；`validate=catalog` 会跳过校验、原样透传上游。
 - 排查：检查 `upstream.llm_base` 连通性与网络/代理；启动日志若有 `[catalog] 远程目录拉取失败…` 即为此问题。
-- 面板顶部「模型数（来源）」会显示当前来源是 `remote` / `cache` / `fallback`。
+- 面板顶部「模型数（来源）」会显示当前来源是 `remote` / `cache` / `empty`。
+
+**启动失败：未知键 `aliases` / `fallback`**
+- `models.aliases` 与 `models.fallback` 已在第四轮移除。配置里若仍留着这两个键，会因未知键报错并以退出码 2 启动失败。
+- 处理：从 `config.json` 删除这两个键；模型名直接使用上游 id（如 `sn-glm-5-3-flash`）。
 
 **账号文件写回失败**
 - 日志出现 `[pool] 警告：…账号文件…` 即写回失败。常见原因：`data/` 目录不可写、挂载为只读、磁盘满。

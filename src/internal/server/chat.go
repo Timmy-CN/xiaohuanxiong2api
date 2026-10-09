@@ -45,7 +45,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 模型解析：缺省回填默认模型，别名映射到上游 id（SPEC §6.3.2）。
+	// 模型解析：缺省回填默认模型，其余原样透传给上游（SPEC4 §F.2.3）。
 	clientModel := ""
 	if raw, ok := fields["model"]; ok {
 		_ = json.Unmarshal(raw, &clientModel)
@@ -55,9 +55,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		resolvedClient = s.cfg.Models.DefaultModelValue()
 	}
 	upstreamModel := resolvedClient
-	if alias, ok := s.cfg.Models.Aliases[resolvedClient]; ok {
-		upstreamModel = alias
-	}
 
 	// 模型校验（SPEC §6.3.3）。
 	if s.cfg.Models.ValidateValue() == "catalog" {

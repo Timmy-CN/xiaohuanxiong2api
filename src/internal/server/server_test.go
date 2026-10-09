@@ -90,7 +90,7 @@ func newTestEnv(t *testing.T, handler http.HandlerFunc, accounts []map[string]an
 		MaxAttempts:          cfg.Accounts.MaxAttemptsValue(),
 		RefreshOn401:         cfg.Accounts.RefreshOn401Value(),
 	}, client, logger)
-	catalog := NewCatalog(client, cfg.Models.CatalogCacheTTL(), cfg.Models.CatalogCacheFileValue(), cfg.Models.Fallback)
+	catalog := NewCatalog(client, cfg.Models.CatalogCacheTTL(), cfg.Models.CatalogCacheFileValue())
 	app := New(cfg, client, accountPool, catalog, logger, "test")
 	httpServer := httptest.NewServer(app.Handler())
 	t.Cleanup(httpServer.Close)
@@ -108,9 +108,9 @@ func (e *testEnv) postChat(t *testing.T, body string) (*http.Response, []byte) {
 	return resp, data
 }
 
-// ── 用例 1：别名映射与缺省模型回填 ──
+// ── 用例 1：显式 model 原样透传 + 缺省模型回填 ──
 
-func TestAliasAndDefaultModel(t *testing.T) {
+func TestDefaultModelBackfillAndPassthrough(t *testing.T) {
 	var mu sync.Mutex
 	var received []string
 	handler := func(w http.ResponseWriter, r *http.Request) {
@@ -134,10 +134,9 @@ func TestAliasAndDefaultModel(t *testing.T) {
 	}
 	env := newTestEnv(t, handler, []map[string]any{{
 		"id": "a1", "access_token": "tok", "enabled": true, "priority": 1, "expires_at": 0,
-	}}, func(cfg *config.Config) {
-		cfg.Models.Aliases = map[string]string{"glm-5.3-flash": "sn-glm-5-3-flash"}
-	})
+	}}, nil)
 
+	// 显式 model 原样透传给上游。
 	resp, data := env.postChat(t, `{"model":"glm-5.3-flash","messages":[{"role":"user","content":"hi"}]}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("状态码 = %d, body=%s", resp.StatusCode, data)
@@ -145,11 +144,11 @@ func TestAliasAndDefaultModel(t *testing.T) {
 	var out map[string]any
 	_ = json.Unmarshal(data, &out)
 	if out["model"] != "glm-5.3-flash" {
-		t.Fatalf("响应 model = %v, 期望别名 glm-5.3-flash", out["model"])
+		t.Fatalf("响应 model = %v, 期望 glm-5.3-flash", out["model"])
 	}
 	mu.Lock()
-	if len(received) != 1 || received[0] != "sn-glm-5-3-flash" {
-		t.Fatalf("上游收到的 model = %v, 期望 sn-glm-5-3-flash", received)
+	if len(received) != 1 || received[0] != "glm-5.3-flash" {
+		t.Fatalf("上游收到的 model = %v, 期望 glm-5.3-flash", received)
 	}
 	mu.Unlock()
 
@@ -169,6 +168,42 @@ func TestAliasAndDefaultModel(t *testing.T) {
 	mu.Unlock()
 }
 
+// ── 用例 1b：strategy 默认值 round_robin（两个账号轮转）──
+
+func TestDefaultStrategyRoundRobin(t *testing.T) {
+	var mu sync.Mutex
+	var tokens []string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			http.NotFound(w, r)
+			return
+		}
+		mu.Lock()
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		mu.Unlock()
+		writeJSON(w, 200, map[string]any{
+			"id": "c", "object": "chat.completion", "model": "internal",
+			"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	}
+	env := newTestEnv(t, handler, []map[string]any{
+		{"id": "a1", "access_token": "token-a", "enabled": true, "priority": 1, "expires_at": 0},
+		{"id": "a2", "access_token": "token-b", "enabled": true, "priority": 2, "expires_at": 0},
+	}, nil) // 不显式配置 strategy → 使用默认 round_robin
+
+	for i := 0; i < 2; i++ {
+		resp, data := env.postChat(t, `{"model":"sn-glm-5-3-flash","messages":[]}`)
+		if resp.StatusCode != 200 {
+			t.Fatalf("第 %d 次状态码 = %d, body=%s", i+1, resp.StatusCode, data)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(tokens) != 2 || tokens[0] != "Bearer token-a" || tokens[1] != "Bearer token-b" {
+		t.Fatalf("默认 round_robin 应轮转到不同账号，实际 = %v", tokens)
+	}
+}
+
 // ── 用例 2：validate=catalog 未知模型 400；目录为空放行 ──
 
 func TestValidateCatalog(t *testing.T) {
@@ -181,6 +216,12 @@ func TestValidateCatalog(t *testing.T) {
 	env := newTestEnv(t, handler, []map[string]any{{
 		"id": "a1", "access_token": "tok", "enabled": true, "priority": 1, "expires_at": 0,
 	}}, nil)
+
+	// 注入一条已知模型：未知模型应 400。
+	env.s.catalog.mu.Lock()
+	env.s.catalog.models = []upstream.Model{{ID: "known-model", DisplayName: "已知", Visible: true}}
+	env.s.catalog.source = "remote"
+	env.s.catalog.mu.Unlock()
 
 	resp, data := env.postChat(t, `{"model":"no-such-model","messages":[]}`)
 	if resp.StatusCode != 400 {
@@ -199,10 +240,45 @@ func TestValidateCatalog(t *testing.T) {
 	// 目录为空 → 放行。
 	env.s.catalog.mu.Lock()
 	env.s.catalog.models = nil
+	env.s.catalog.source = "empty"
 	env.s.catalog.mu.Unlock()
 	resp, data = env.postChat(t, `{"model":"no-such-model","messages":[]}`)
 	if resp.StatusCode != 200 {
 		t.Fatalf("目录为空时应放行，状态码 = %d, body=%s", resp.StatusCode, data)
+	}
+}
+
+// ── 用例 2b：目录为空 + validate=catalog → 原样透传上游 ──
+
+func TestCatalogEmptyValidatePassthrough(t *testing.T) {
+	var mu sync.Mutex
+	var received []string
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]json.RawMessage
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		var model string
+		_ = json.Unmarshal(body["model"], &model)
+		mu.Lock()
+		received = append(received, model)
+		mu.Unlock()
+		writeJSON(w, 200, map[string]any{
+			"id": "c", "object": "chat.completion", "model": "internal",
+			"choices": []map[string]any{{"index": 0, "message": map[string]any{"role": "assistant", "content": "ok"}}},
+		})
+	}
+	env := newTestEnv(t, handler, []map[string]any{{
+		"id": "a1", "access_token": "tok", "enabled": true, "priority": 1, "expires_at": 0,
+	}}, nil)
+
+	// newTestEnv 未加载缓存/刷新，目录为空。
+	resp, data := env.postChat(t, `{"model":"no-such-model","messages":[]}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("目录为空时应原样透传，状态码 = %d, body=%s", resp.StatusCode, data)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(received) != 1 || received[0] != "no-such-model" {
+		t.Fatalf("上游收到的 model = %v, 期望 no-such-model", received)
 	}
 }
 
@@ -327,9 +403,7 @@ func TestStreamingRewrite(t *testing.T) {
 	}
 	env := newTestEnv(t, handler, []map[string]any{{
 		"id": "a1", "access_token": "tok", "enabled": true, "priority": 1, "expires_at": 0,
-	}}, func(cfg *config.Config) {
-		cfg.Models.Aliases = map[string]string{"glm-5.3-flash": "sn-glm-5-3-flash"}
-	})
+	}}, nil)
 
 	resp, data := env.postChat(t, `{"model":"glm-5.3-flash","messages":[],"stream":true}`)
 	if resp.StatusCode != 200 {
@@ -433,7 +507,7 @@ func TestCatalogRemoteFailureUsesCache(t *testing.T) {
 	if err := os.WriteFile(cacheFile, data, 0o600); err != nil {
 		t.Fatalf("写缓存失败: %v", err)
 	}
-	catalog := NewCatalog(client, time.Minute, cacheFile, nil)
+	catalog := NewCatalog(client, time.Minute, cacheFile)
 	if !catalog.LoadCache() {
 		t.Fatal("应从缓存加载")
 	}
@@ -449,38 +523,38 @@ func TestCatalogRemoteFailureUsesCache(t *testing.T) {
 	}
 }
 
-func TestCatalogNoCacheUsesFallback(t *testing.T) {
+// TestCatalogNoCacheIsEmpty 覆盖「远程失败且无缓存 → 目录为空（来源 empty）」。
+func TestCatalogNoCacheIsEmpty(t *testing.T) {
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", 500)
 	}))
 	defer upstreamServer.Close()
 	client := upstream.NewClient(upstream.Options{LLMBase: upstreamServer.URL, CatalogTimeout: time.Second})
-	catalog := NewCatalog(client, time.Minute, filepath.Join(t.TempDir(), "missing.json"), nil)
+	catalog := NewCatalog(client, time.Minute, filepath.Join(t.TempDir(), "missing.json"))
 	if catalog.LoadCache() {
 		t.Fatal("不应从缺失缓存加载")
 	}
 	if err := catalog.Refresh(context.Background(), ""); err == nil {
 		t.Fatal("远程失败时 Refresh 应返回错误")
 	}
-	if len(catalog.Models("")) == 0 {
-		t.Fatal("无缓存时应使用内置兜底，且非空")
+	if models := catalog.Models(""); len(models) != 0 {
+		t.Fatalf("无缓存时应为空，实际: %+v", models)
 	}
-	if catalog.Source() != "fallback" {
-		t.Fatalf("来源 = %q, 期望 fallback", catalog.Source())
+	if catalog.Source() != "empty" {
+		t.Fatalf("来源 = %q, 期望 empty", catalog.Source())
 	}
 }
 
-// TestModelsEndpointNeverEmpty 覆盖「上游不可达时 /v1/models 也不能返回空」。
-func TestModelsEndpointNeverEmpty(t *testing.T) {
+// TestModelsEndpointEmptyCatalog 覆盖「目录为空时 /v1/models 返回 200 + 空 data」。
+func TestModelsEndpointEmptyCatalog(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", 500)
 	}
 	env := newTestEnv(t, handler, nil, nil)
-	// 让目录退化为纯兜底。
-	env.s.catalog.mu.Lock()
-	env.s.catalog.models = upstream.BuiltinModels()
-	env.s.catalog.source = "fallback"
-	env.s.catalog.mu.Unlock()
+	// newTestEnv 不加载缓存/刷新，目录天然为空。
+	if env.s.catalog.Count() != 0 {
+		t.Fatalf("测试前置：目录应为空，实际 %d", env.s.catalog.Count())
+	}
 
 	resp, err := http.Get(env.hs.URL + "/v1/models")
 	if err != nil {
@@ -488,13 +562,23 @@ func TestModelsEndpointNeverEmpty(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		t.Fatalf("状态码 = %d, body=%s", resp.StatusCode, data)
+	}
 	var payload struct {
-		Data []map[string]any `json:"data"`
+		Object string           `json:"object"`
+		Data   []map[string]any `json:"data"`
 	}
 	if err := json.Unmarshal(data, &payload); err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
-	if len(payload.Data) == 0 {
-		t.Fatalf("/v1/models 不应为空: %s", data)
+	if payload.Object != "list" {
+		t.Fatalf("object = %q, 期望 list", payload.Object)
+	}
+	if len(payload.Data) != 0 {
+		t.Fatalf("空目录 data 应为空数组: %s", data)
+	}
+	if !strings.Contains(string(data), `"data":[]`) {
+		t.Fatalf("空目录应输出 data:[]，实际: %s", data)
 	}
 }

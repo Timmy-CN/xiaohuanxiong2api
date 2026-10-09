@@ -34,9 +34,7 @@ func TestJSONCCommentsAndTrailingComma(t *testing.T) {
 		"listen": "127.0.0.1:9999", /* 块注释 */
 		"api_key": "secret",
 		"models": {
-			"aliases": {
-				"a": "b", // 尾逗号在下面
-			},
+			"default": "sn-glm-5-3-flash", // 尾逗号在下面
 		},
 	}`
 	cfg, err := Load(writeTemp(t, content))
@@ -49,8 +47,8 @@ func TestJSONCCommentsAndTrailingComma(t *testing.T) {
 	if got := *cfg.APIKey; got != "secret" {
 		t.Fatalf("api_key = %q, 期望 secret", got)
 	}
-	if got := cfg.Models.Aliases["a"]; got != "b" {
-		t.Fatalf("alias a = %q, 期望 b", got)
+	if got := *cfg.Models.Default; got != "sn-glm-5-3-flash" {
+		t.Fatalf("models.default = %q, 期望 sn-glm-5-3-flash", got)
 	}
 }
 
@@ -101,6 +99,9 @@ func TestDefaultsWhenMissing(t *testing.T) {
 	}
 	if *cfg.Accounts.Strategy != DefaultStrategy {
 		t.Fatalf("strategy 默认值 = %q", *cfg.Accounts.Strategy)
+	}
+	if *cfg.Accounts.Strategy != "round_robin" {
+		t.Fatalf("strategy 默认值应为 round_robin，实际 %q", *cfg.Accounts.Strategy)
 	}
 	if *cfg.Accounts.MaxAttempts != DefaultMaxAttempts {
 		t.Fatalf("max_attempts 默认值 = %d", *cfg.Accounts.MaxAttempts)
@@ -182,14 +183,27 @@ func TestExampleConfigParses(t *testing.T) {
 	if *cfg.Listen != "0.0.0.0:3066" {
 		t.Fatalf("example listen = %q", *cfg.Listen)
 	}
-	if len(cfg.Models.Aliases) == 0 {
-		t.Fatal("example 应包含别名")
+	if cfg.Accounts.StrategyValue() != "round_robin" {
+		t.Fatalf("example strategy = %q, 期望 round_robin", cfg.Accounts.StrategyValue())
 	}
 	if !cfg.Checkin.EnabledValue() || cfg.Checkin.TimeValue() != "00:01" {
 		t.Fatalf("example checkin = %+v", cfg.Checkin)
 	}
 	if cfg.Upstream.OriginURL() != "https://xiaohuanxiong.com" {
 		t.Fatalf("example origin = %q", cfg.Upstream.OriginURL())
+	}
+}
+
+// TestRemovedKeysRejected 覆盖「已移除的 aliases / fallback 留在配置里会启动失败」。
+func TestRemovedKeysRejected(t *testing.T) {
+	clearEnv(t)
+	for name, content := range map[string]string{
+		"aliases":  `{"models": {"aliases": {"a": "b"}}}`,
+		"fallback": `{"models": {"fallback": []}}`,
+	} {
+		if _, err := Load(writeTemp(t, content)); err == nil {
+			t.Fatalf("%s 已移除，留在配置里应报未知键错误", name)
+		}
 	}
 }
 
