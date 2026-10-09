@@ -114,6 +114,23 @@
   button.btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   button.btn:disabled { opacity: .5; cursor: not-allowed; }
   button.btn.danger:hover:not(:disabled) { border-color: var(--err); color: var(--err); }
+  button.btn.primary {
+    background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600;
+  }
+  button.btn.primary:hover:not(:disabled) { background: #6badff; color: #0b1220; }
+  .login-box {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .login-box .hint { color: var(--muted); font-size: 12px; }
+  .login-box .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .login-box a { color: var(--accent); word-break: break-all; }
+  .login-box input {
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px; font: inherit; width: 100%;
+  }
+  .login-box .ttl { color: var(--muted); font-size: 12px; }
   .add-form {
     display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
     gap: 10px 14px; background: var(--panel); border: 1px solid var(--border);
@@ -163,8 +180,25 @@
 <section>
   <h2>账号池</h2>
   <div class="toolbar">
-    <button id="toggle-add" class="btn" type="button">新增账号</button>
+    <button id="toggle-login" class="btn primary" type="button">网页登录</button>
+    <button id="toggle-add" class="btn" type="button">手动添加账号</button>
     <span id="accounts-msg" class="form-msg"></span>
+  </div>
+  <div id="login-box" class="login-box" hidden>
+    <div class="row">
+      <a id="login-link" href="#" target="_blank" rel="noopener noreferrer">打开小浣熊登录页</a>
+      <button id="login-copy" class="btn" type="button">复制链接</button>
+      <span id="login-ttl" class="ttl"></span>
+    </div>
+    <div class="hint">
+      登录成功后浏览器会跳到 <code>office-raccoon://auth/callback?...</code>（页面打不开是正常的），
+      把地址栏里的<strong>整条 URL</strong>复制到下面粘贴。
+    </div>
+    <input id="login-callback" type="text" autocomplete="off" placeholder="office-raccoon://auth/callback?code=…&state=…">
+    <div class="row">
+      <button id="login-submit" class="btn primary" type="button">完成登录</button>
+      <span id="login-msg" class="form-msg"></span>
+    </div>
   </div>
   <form id="add-account-form" class="add-form" hidden>
     <div class="field">
@@ -386,6 +420,10 @@
       var acc = s.accounts || {};
       document.getElementById("accounts-count").textContent =
         text(acc.available) + " / " + text(acc.total);
+      var login = s.login || {};
+      loginEnabled = login.enabled !== false;
+      document.getElementById("toggle-login").hidden = !loginEnabled;
+      if (!loginEnabled) document.getElementById("login-box").hidden = true;
       return true;
     });
   }
@@ -533,6 +571,78 @@
           msg.textContent = err.message;
           msg.className = "form-msg wide err";
         })
+        .then(function () { submit.disabled = false; });
+    });
+  })();
+
+  // ── 2c. 网页登录 ──
+  var loginEnabled = false;
+
+  function fmtTtl(sec) {
+    if (sec === undefined || sec === null) return "";
+    var m = Math.round(sec / 60);
+    if (m <= 0) return "立即过期";
+    return m + " 分钟内有效";
+  }
+
+  function showLoginMsg(msg, isErr) {
+    var el = document.getElementById("login-msg");
+    el.textContent = msg || "";
+    el.className = "form-msg " + (isErr ? "err" : "ok");
+  }
+
+  (function wireLogin() {
+    var box = document.getElementById("login-box");
+    var link = document.getElementById("login-link");
+    var ttlEl = document.getElementById("login-ttl");
+    var input = document.getElementById("login-callback");
+    var copyBtn = document.getElementById("login-copy");
+    var submit = document.getElementById("login-submit");
+
+    document.getElementById("toggle-login").addEventListener("click", function () {
+      if (!box.hidden) { box.hidden = true; return; }
+      var btn = document.getElementById("toggle-login");
+      btn.disabled = true;
+      showLoginMsg("");
+      writeJSON("POST", "/admin/api/login/start")
+        .then(function (res) {
+          var url = (res && res.url) || "";
+          link.setAttribute("href", url);
+          ttlEl.textContent = fmtTtl(res && res.ttl_seconds);
+          box.hidden = false;
+        })
+        .catch(function (err) { showAccountsMsg(err.message, true); })
+        .then(function () { btn.disabled = false; });
+    });
+
+    copyBtn.addEventListener("click", function () {
+      var url = link.getAttribute("href") || "";
+      if (!url || url === "#") { showLoginMsg("请先点「网页登录」生成链接", true); return; }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(function () {
+          showLoginMsg("已复制登录链接", false);
+        }, function () {
+          showLoginMsg("复制失败，请手动选中链接复制", true);
+        });
+      } else {
+        showLoginMsg("当前浏览器不支持自动复制，请手动选中链接复制", true);
+      }
+    });
+
+    submit.addEventListener("click", function () {
+      var value = (input.value || "").trim();
+      if (!value) { showLoginMsg("请先粘贴登录回调地址", true); return; }
+      submit.disabled = true;
+      showLoginMsg("登录中…", false);
+      writeJSON("POST", "/admin/api/login/exchange", { callback_url: value })
+        .then(function (res) {
+          box.hidden = true;
+          input.value = "";
+          showLoginMsg("");
+          showAccountsMsg("登录成功：" + ((res && res.id) || ""), false);
+          return loadAccounts();
+        })
+        .catch(function (err) { showLoginMsg(err.message, true); })
         .then(function () { submit.disabled = false; });
     });
   })();

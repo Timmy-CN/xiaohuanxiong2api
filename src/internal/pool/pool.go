@@ -98,6 +98,17 @@ func (a *Account) clone() *Account {
 	return &dup
 }
 
+// SetExtra 设置一个未知字段（回写账号文件时原样保留）。
+//
+// 网页登录换回的 office_identity / office_org_name / office_org_role 用它落盘
+// （SPEC5 §K2），与账号文件里既有的未知字段走同一份存储。
+func (a *Account) SetExtra(key string, value json.RawMessage) {
+	if a.extra == nil {
+		a.extra = map[string]json.RawMessage{}
+	}
+	a.extra[key] = value
+}
+
 // Config 是账号池配置（由 §3 accounts 换算）。
 type Config struct {
 	File                 string
@@ -479,6 +490,39 @@ func (p *Pool) Add(account *Account) error {
 	p.accounts = append(p.accounts, account.clone())
 	p.mu.Unlock()
 	return p.persist()
+}
+
+// Upsert 按 id 新增或更新账号（SPEC5 §K2 网页登录落账号）。
+//
+// 已存在时只更新 token / expires_at / user_id 与未知字段（office_*），
+// 保留 name / enabled / priority 等用户设置；返回 updated=true。
+// 不存在时按新增处理，返回 updated=false。持锁期间不写盘。
+func (p *Pool) Upsert(account *Account) (bool, error) {
+	if account == nil {
+		return false, errors.New("账号为空")
+	}
+	p.mu.Lock()
+	existing := p.findLocked(account.ID)
+	updated := existing != nil
+	if updated {
+		existing.AccessToken = account.AccessToken
+		if account.RefreshToken != "" {
+			existing.RefreshToken = account.RefreshToken
+		}
+		existing.ExpiresAt = account.ExpiresAt
+		existing.UserID = account.UserID
+		existing.LastError = ""
+		for key, value := range account.extra {
+			if existing.extra == nil {
+				existing.extra = map[string]json.RawMessage{}
+			}
+			existing.extra[key] = value
+		}
+	} else {
+		p.accounts = append(p.accounts, account.clone())
+	}
+	p.mu.Unlock()
+	return updated, p.persist()
 }
 
 // Update 只改给出的字段并原子回写；账号不存在返回 ErrAccountNotFound。

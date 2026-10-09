@@ -53,5 +53,10 @@
     "history_file": "./data/checkin.json",
     "history_days": 30                 // history 只保留最近 N 天
   },
+  "login": {
+    "enabled": true,                   // 关掉时两个登录接口返回 403（面板隐藏入口）
+    "app_name": "办公小浣熊客户端",     // 授权页上报的客户端名（中文，会正确 URL 编码）
+    "state_ttl_seconds": 600           // state 有效期（秒）；过期后必须重新发起
+  },
   "shutdown_timeout_seconds": 10        // 优雅退出超时（SPEC §6.6）
 }

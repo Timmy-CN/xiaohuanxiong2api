@@ -192,6 +192,12 @@ func TestExampleConfigParses(t *testing.T) {
 	if cfg.Upstream.OriginURL() != "https://xiaohuanxiong.com" {
 		t.Fatalf("example origin = %q", cfg.Upstream.OriginURL())
 	}
+	if !cfg.Login.LoginEnabled() || cfg.Login.LoginAppName() != DefaultLoginAppName {
+		t.Fatalf("example login = %+v", cfg.Login)
+	}
+	if cfg.Login.StateTTL().Seconds() != DefaultLoginStateTTLSeconds {
+		t.Fatalf("example login.state_ttl = %v", cfg.Login.StateTTL())
+	}
 }
 
 // TestRemovedKeysRejected 覆盖「已移除的 aliases / fallback 留在配置里会启动失败」。
@@ -248,5 +254,40 @@ func TestBadOrigin(t *testing.T) {
 	_, err := Load(writeTemp(t, content))
 	if err == nil || !strings.Contains(err.Error(), "origin") {
 		t.Fatalf("期望 origin 校验失败，实际: %v", err)
+	}
+}
+
+// TestLoginDefaults 覆盖「login 缺失 → 默认值」以及显式 0/false。
+func TestLoginDefaults(t *testing.T) {
+	clearEnv(t)
+	cfg, err := Load(writeTemp(t, `{}`))
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if !cfg.Login.LoginEnabled() || cfg.Login.LoginAppName() != DefaultLoginAppName {
+		t.Fatalf("login 默认值错误: %+v", cfg.Login)
+	}
+	if cfg.Login.StateTTL().Seconds() != DefaultLoginStateTTLSeconds {
+		t.Fatalf("state_ttl 默认值 = %v", cfg.Login.StateTTL())
+	}
+
+	cfg2, err := Load(writeTemp(t, `{"login": {"enabled": false, "state_ttl_seconds": 0}}`))
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg2.Login.LoginEnabled() {
+		t.Fatal("login.enabled 显式 false 应为 false")
+	}
+	if cfg2.Login.StateTTL() != 0 {
+		t.Fatalf("state_ttl 显式 0 = %v", cfg2.Login.StateTTL())
+	}
+}
+
+// TestBadLoginTTL 覆盖「login.state_ttl_seconds 不能为负」。
+func TestBadLoginTTL(t *testing.T) {
+	clearEnv(t)
+	_, err := Load(writeTemp(t, `{"login": {"state_ttl_seconds": -1}}`))
+	if err == nil || !strings.Contains(err.Error(), "login.state_ttl_seconds") {
+		t.Fatalf("期望 state_ttl_seconds 校验失败，实际: %v", err)
 	}
 }

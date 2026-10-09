@@ -182,6 +182,17 @@ curl -sN -H 'Content-Type: application/json' \
 | `history_file` | `"./data/checkin.json"` | 签到历史文件。 |
 | `history_days` | `30` | 历史保留天数（按日期去重）。 |
 
+### `login`
+
+| 键 | 默认值 | 含义 |
+|---|---|---|
+| `enabled` | `true` | 是否启用网页登录；`false` 时两个登录接口返回 403，面板隐藏「网页登录」入口（手动添加仍可用）。 |
+| `app_name` | `"办公小浣熊客户端"` | 授权页上报的客户端名（中文，会正确 URL 编码）。 |
+| `state_ttl_seconds` | `600` | 登录 state 有效期（秒）；过期后必须重新发起。`0` 表示立即过期（仅测试用）。 |
+
+> 授权页路径 `/code/authorize`、`login_source=desktop` 与回调 `office-raccoon://auth/callback`
+> 是**协议常量**，不做配置项。
+
 ---
 
 ## 账号文件与 token 获取
@@ -251,6 +262,8 @@ curl -sN -H 'Content-Type: application/json' \
 | GET | `/admin`、`/admin/` | `admin.api_key` | 内嵌管理面板 HTML。 |
 | GET | `/admin/api/*` | `admin.api_key` | 只读 JSON 接口（见下）。 |
 | POST/PATCH/DELETE | `/admin/api/accounts…` | `admin.api_key` | 账号管理写接口（见「面板管理账号」）。 |
+| POST | `/admin/api/login/start` | `admin.api_key` | 发起网页登录，返回授权页 URL 与 state（见「网页登录」）。 |
+| POST | `/admin/api/login/exchange` | `admin.api_key` | 用回调 URL（或 code+state）换凭证并落账号。 |
 
 `/admin/api/*` 的只读 GET：
 
@@ -269,7 +282,7 @@ curl -sN -H 'Content-Type: application/json' \
 
 浏览器打开 `http://<监听地址>/admin`（设置了 `admin.api_key` 时用 `/admin?key=<key>`）。
 
-- 展示状态，并提供**账号管理**（新增 / 启用禁用 / 删除 / 测试）。
+- 展示状态，并提供**账号管理**（网页登录 / 手动新增 / 启用禁用 / 删除 / 测试）。
 - **每 5 秒自动刷新**一次；某次刷新失败时顶部显示「接口不可用」，但**不会清空**已展示的数据。
 - 自上而下包含六块：顶部状态条、账号池、积分卡、每日签到、模型目录、最近请求。
 - 页面为**单文件、零外部依赖**（无 CDN / 外部字体 / 图标），离线可用；暗色主题，窄屏可用（表格可横向滚动）。
@@ -292,6 +305,40 @@ curl -sN -H 'Content-Type: application/json' \
 - `expires_at` / `user_id` 从 JWT 解析；解析不出则 `expires_at = 0`（不主动刷新，靠 401 触发）、`user_id = ""`。
 - 每次写操作成功后**原子回写** `accounts.json`（临时文件 + rename、权限 `0600`、保留未知字段）。
 - 面板「账号池」表格的「操作」列即可启用/禁用、删除（二次确认）、测试；表格上方「新增账号」按钮展开表单。
+
+---
+
+## 网页登录（一次性授权码换凭证）
+
+面板「账号池」上方的**「网页登录」**按钮走小浣熊官方登录页，登录成功后自动拿到
+`access_token` / `refresh_token`，**不需要手动粘贴 token**。
+
+流程（`login.enabled=true` 时）：
+
+1. 面板点「网页登录」→ `POST /admin/api/login/start`，服务用 `crypto/rand` 生成一次性
+   `state`（32 位十六进制，带过期时间）并返回授权页 URL：
+   `https://xiaohuanxiong.com/code/authorize?login_source=desktop&appname=…&state=…`。
+2. 打开该链接，在官方页面用微信/验证码/密码登录；成功后官方页面跳转自定义协议
+   `office-raccoon://auth/callback?code=…&state=…`（浏览器打不开这个协议是正常的）。
+3. 把地址栏里的**整条 URL** 复制回面板输入框，点「完成登录」→
+   `POST /admin/api/login/exchange`，服务校验 state 后用 code 调
+   `POST {auth_base}/login_with_authorization_code` 换凭证并落账号。
+
+接口：
+
+| 方法 | 路径 | body | 成功返回 |
+|---|---|---|---|
+| POST | `/admin/api/login/start` | 无 | `{"url":…,"state":…,"expires_at":…,"ttl_seconds":…}` |
+| POST | `/admin/api/login/exchange` | `{"callback_url":"office-raccoon://auth/callback?code=…&state=…"}` 或 `{"code":…,"state":…}` | `{"id":"user-…","updated":false,"account":{…}}`（同 id 再登录一次为 `updated:true`） |
+
+- 鉴权沿用 `/admin/api/*`：`Authorization: Bearer <key>` 或 `?key=<key>`；`admin.api_key` 为空时返回 403。
+- **state 安全语义**：state 由本服务生成、内存 pending 表登记（带过期时间）；回调里的 state 必须与其中
+  一条逐字相等且未过期，且**一次性消费**。校验失败/过期/缺失一律 400，且**不调用上游**。
+  回调 URL 解析后逐项比对 `scheme=office-raccoon`、`host=auth`（大小写不敏感）、`path=/callback`，
+  不使用前缀匹配。`code` ≤ 8192、`state` ≤ 512 字符。
+- `login.enabled=false` 时两个接口返回 403「网页登录已禁用（config.json 的 login.enabled=false）」，面板隐藏入口。
+- 换回的 `office_identity` / `office_org_name` / `office_org_role` 非空时一并写入账号记录（作为未知字段保留）。
+- 日志只记 `[login]` 的 id/结果，**不打印 code 或 token**。
 
 ---
 
@@ -349,7 +396,7 @@ curl -sN -H 'Content-Type: application/json' \
 ### 已知限制
 
 - 仅代理**文本**聊天与 function calling；上游网页端的**图片/文件上传**等能力不在此反代范围内。
-- **不支持**注册机、网页登录/OAuth 换 code、新手任务等；本服务只用你已登录拿到的 token。
+- **不支持**注册机、新手任务等；网页登录已支持（见「网页登录」），也可手动粘贴 token。
 - 上游模型行为、额度、风控策略随时可能变化，本项目不保证长期可用。
 - 单账号被多处同时刷新会互相顶掉（见上文 token 说明）。
 

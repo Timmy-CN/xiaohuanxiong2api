@@ -63,6 +63,11 @@ const (
 	DefaultCheckinMaxAttemptsPerDay    = 5
 	DefaultCheckinHistoryFile          = "./data/checkin.json"
 	DefaultCheckinHistoryDays          = 30
+
+	// §J 网页登录默认值。
+	DefaultLoginEnabled         = true
+	DefaultLoginAppName         = "办公小浣熊客户端"
+	DefaultLoginStateTTLSeconds = 600
 )
 
 // Config 是完整的应用配置。
@@ -75,6 +80,7 @@ type Config struct {
 	Log                    LogConfig      `json:"log"`
 	Admin                  AdminConfig    `json:"admin"`
 	Checkin                CheckinConfig  `json:"checkin"`
+	Login                  LoginConfig    `json:"login"`
 	ShutdownTimeoutSeconds *int           `json:"shutdown_timeout_seconds"`
 }
 
@@ -140,6 +146,13 @@ type CheckinConfig struct {
 	MaxAttemptsPerDay    *int    `json:"max_attempts_per_day"`
 	HistoryFile          *string `json:"history_file"`
 	HistoryDays          *int    `json:"history_days"`
+}
+
+// LoginConfig 是网页登录配置（SPEC5 §J）。
+type LoginConfig struct {
+	Enabled         *bool   `json:"enabled"`
+	AppName         *string `json:"app_name"`
+	StateTTLSeconds *int    `json:"state_ttl_seconds"`
 }
 
 // ResolvePath 解析配置文件路径：XHX_CONFIG 优先，其次命令行传入值。
@@ -260,6 +273,10 @@ func (c *Config) applyDefaults() {
 	ci.MaxAttemptsPerDay = intPtr(ci.MaxAttemptsPerDay, DefaultCheckinMaxAttemptsPerDay)
 	ci.HistoryFile = strPtr(ci.HistoryFile, DefaultCheckinHistoryFile)
 	ci.HistoryDays = intPtr(ci.HistoryDays, DefaultCheckinHistoryDays)
+	lg := &c.Login
+	lg.Enabled = boolPtr(lg.Enabled, DefaultLoginEnabled)
+	lg.AppName = strPtr(lg.AppName, DefaultLoginAppName)
+	lg.StateTTLSeconds = intPtr(lg.StateTTLSeconds, DefaultLoginStateTTLSeconds)
 	c.ShutdownTimeoutSeconds = intPtr(c.ShutdownTimeoutSeconds, DefaultShutdownTimeoutSeconds)
 }
 
@@ -331,6 +348,7 @@ func (c *Config) Validate() error {
 		{"log.buffer_size", *c.Log.BufferSize},
 		{"checkin.retry_interval_minutes", *c.Checkin.RetryIntervalMinutes},
 		{"checkin.history_days", *c.Checkin.HistoryDays},
+		{"login.state_ttl_seconds", *c.Login.StateTTLSeconds},
 		{"shutdown_timeout_seconds", *c.ShutdownTimeoutSeconds},
 	}
 	for _, s := range seconds {
@@ -672,4 +690,15 @@ func (c *CheckinConfig) HistoryFileValue() string {
 // HistoryDaysValue 返回历史保留天数。
 func (c *CheckinConfig) HistoryDaysValue() int {
 	return derefInt(c.HistoryDays, DefaultCheckinHistoryDays)
+}
+
+// LoginEnabled 返回是否启用网页登录（SPEC5 §J）。
+func (l *LoginConfig) LoginEnabled() bool { return derefBool(l.Enabled, DefaultLoginEnabled) }
+
+// LoginAppName 返回授权页上报的客户端名。
+func (l *LoginConfig) LoginAppName() string { return derefStr(l.AppName, DefaultLoginAppName) }
+
+// StateTTL 返回 state 有效期（SPEC5 §J）。
+func (l *LoginConfig) StateTTL() time.Duration {
+	return time.Duration(derefInt(l.StateTTLSeconds, DefaultLoginStateTTLSeconds)) * time.Second
 }

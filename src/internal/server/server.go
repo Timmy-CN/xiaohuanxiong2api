@@ -23,6 +23,7 @@ type Server struct {
 	logs    *LogBuffer
 	logger  *logx.Logger
 	checkin *checkin.Service
+	login   *loginManager
 
 	startedAt time.Time
 	version   string
@@ -37,6 +38,7 @@ func New(cfg *config.Config, client *upstream.Client, accountPool *pool.Pool, ca
 		catalog:   catalog,
 		logs:      NewLogBuffer(cfg.Log.BufferSizeValue()),
 		logger:    logger,
+		login:     newLoginManager(),
 		startedAt: time.Now(),
 		version:   ver,
 	}

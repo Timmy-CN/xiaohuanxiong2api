@@ -33,6 +33,10 @@ func (s *Server) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		s.adminRequests(w, r)
 	case "/admin/api/checkin":
 		s.adminCheckin(w, r)
+	case "/admin/api/login/start":
+		s.adminLoginStart(w, r)
+	case "/admin/api/login/exchange":
+		s.adminLoginExchange(w, r)
 	default:
 		if id, action, ok := accountSubPath(r.URL.Path); ok {
 			s.adminAccountByID(w, r, id, action)
@@ -82,6 +86,10 @@ func (s *Server) adminStatus(w http.ResponseWriter, _ *http.Request) {
 			"count":        s.catalog.Count(),
 			"source":       s.catalog.Source(),
 			"refreshed_at": s.catalog.RefreshedAt(),
+		},
+		"login": map[string]any{
+			"enabled": s.cfg.Login.LoginEnabled(),
+			"pending": s.login.pendingCount(),
 		},
 	})
 }
