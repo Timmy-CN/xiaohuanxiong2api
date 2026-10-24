@@ -75,9 +75,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	upstreamModel := resolvedClient
 
-	// 模型校验（SPEC §6.3.3）。
+	// 模型校验（SPEC §6.3.3）：只看真实目录（remote/cache）；目录为空时跳过
+	// 校验放行（/v1/models 此刻展示的是兜底表，两者互不影响）。
 	if s.cfg.Models.ValidateValue() == "catalog" {
-		if s.catalog.Count() == 0 {
+		if s.catalog.Empty() {
 			s.logger.Warnf("[chat] 警告：模型目录为空，跳过模型校验（model=%s）", resolvedClient)
 		} else if !s.catalog.Has(upstreamModel) {
 			s.logger.Warnf("[chat] 未知模型 %s，拒绝请求（可用模型见 /v1/models）", resolvedClient)

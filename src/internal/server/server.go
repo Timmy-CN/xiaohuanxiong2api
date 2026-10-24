@@ -24,6 +24,7 @@ type Server struct {
 	logger  *logx.Logger
 	checkin *checkin.Service
 	login   *loginManager
+	loopback *loopbackManager
 
 	startedAt time.Time
 	version   string
@@ -39,6 +40,7 @@ func New(cfg *config.Config, client *upstream.Client, accountPool *pool.Pool, ca
 		logs:      NewLogBuffer(cfg.Log.BufferSizeValue()),
 		logger:    logger,
 		login:     newLoginManager(),
+		loopback:  &loopbackManager{},
 		startedAt: time.Now(),
 		version:   ver,
 	}

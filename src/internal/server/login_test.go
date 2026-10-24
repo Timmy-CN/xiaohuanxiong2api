@@ -45,6 +45,15 @@ func TestLoginStart(t *testing.T) {
 	if rawURL == "" || state == "" {
 		t.Fatalf("start 返回缺少 url/state: %+v", first)
 	}
+	// 64 位十六进制是授权页 loopback 契约的硬性要求（短了报「授权链接无效」）。
+	if len(state) != 64 {
+		t.Fatalf("state 长度 = %d, 期望 64 位十六进制", len(state))
+	}
+	for _, r := range state {
+		if !strings.ContainsRune("0123456789abcdef", r) {
+			t.Fatalf("state 含非十六进制字符: %q", state)
+		}
+	}
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		t.Fatalf("返回的 url 不可解析: %v", err)
@@ -377,5 +386,278 @@ func TestLoginRequiresAdminKey(t *testing.T) {
 		if !strings.Contains(string(data), "admin.api_key") {
 			t.Fatalf("%s 未返回 admin.api_key 提示: %s", path, data)
 		}
+	}
+}
+
+// TestLoginExchangeDedupesHexIssAccount：真实小浣熊 JWT 把用户 id 放在 iss
+// （十六进制串）。同账号重复登录必须落同一个 user-<十进制> id（updated=true），
+// 而不是识别不出 uid、各落一个随机 acct-*。
+func TestLoginExchangeDedupesHexIssAccount(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/login_with_authorization_code" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"code": 0, "message": "ok",
+			"data": map[string]any{
+				"access_token":  testJWTiss(time.Now().Add(2*time.Hour).Unix(), "74350b"),
+				"refresh_token": "rt-1",
+			},
+		})
+	}
+	const key = "k-login-hex-iss"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	_, start := env.loginStart(t, key)
+	state, _ := start["state"].(string)
+	callback := fmt.Sprintf("office-raccoon://auth/callback?code=CODE-1&state=%s", state)
+	status, data := env.loginExchange(t, key, fmt.Sprintf(`{"callback_url":%q}`, callback))
+	if status != http.StatusOK {
+		t.Fatalf("exchange 状态码 = %d, 期望 200, body=%s", status, data)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("解析 exchange 响应失败: %v", err)
+	}
+	if out["id"] != "user-7615755" {
+		t.Fatalf("id = %v, 期望 user-7615755（0x74350b 的十进制）", out["id"])
+	}
+
+	// 同一账号再登录一次 → updated:true，文件里只有一条该 id。
+	_, start2 := env.loginStart(t, key)
+	state2, _ := start2["state"].(string)
+	callback2 := fmt.Sprintf("office-raccoon://auth/callback?code=CODE-2&state=%s", state2)
+	status2, data2 := env.loginExchange(t, key, fmt.Sprintf(`{"callback_url":%q}`, callback2))
+	if status2 != http.StatusOK {
+		t.Fatalf("二次 exchange 状态码 = %d, 期望 200, body=%s", status2, data2)
+	}
+	var out2 map[string]any
+	if err := json.Unmarshal(data2, &out2); err != nil {
+		t.Fatalf("解析二次 exchange 响应失败: %v", err)
+	}
+	if out2["updated"] != true {
+		t.Fatalf("同 id 再登录 updated = %v, 期望 true", out2["updated"])
+	}
+	accounts := readAccountsFile(t, env.s.cfg.Accounts.AccountsFile())
+	count := 0
+	for _, a := range accounts {
+		var id string
+		_ = json.Unmarshal(a["id"], &id)
+		if id == "user-7615755" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("同账号重复登录应只落一条 user-7615755，实际 %d 条", count)
+	}
+}
+
+// loopbackStart 调 /admin/api/login/loopback/start，返回 url/state/port。
+func loopbackStart(t *testing.T, e *testEnv, key string) (string, string, int) {
+	t.Helper()
+	resp, data := e.writeReq(t, http.MethodPost, "/admin/api/login/loopback/start", "", key)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("loopback start 状态码 = %d, body=%s", resp.StatusCode, data)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("解析 start 响应失败: %v", err)
+	}
+	rawURL, _ := out["url"].(string)
+	state, _ := out["state"].(string)
+	port := int(out["port"].(float64))
+	if rawURL == "" || state == "" || port == 0 {
+		t.Fatalf("start 返回缺少 url/state/port: %v", out)
+	}
+	return rawURL, state, port
+}
+
+func loopbackStatus(t *testing.T, e *testEnv, key, state string) (int, map[string]any) {
+	t.Helper()
+	resp, data := e.writeReq(t, http.MethodGet, "/admin/api/login/loopback/status?state="+url.QueryEscape(state), "", key)
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	return resp.StatusCode, out
+}
+
+// 完整流程：start → URL 带回跳参数 → 浏览器回调（真实打到 127.0.0.1 监听器）
+// → 换凭证落账号 → status success → state 已消费。
+func TestLoginLoopbackFlow(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/login_with_authorization_code" {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"code": 0, "message": "ok",
+			"data": map[string]any{
+				"access_token":  testJWTiss(time.Now().Add(2*time.Hour).Unix(), "74350b"),
+				"refresh_token": "rt-1",
+			},
+		})
+	}
+	const key = "k-loopback-flow"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	rawURL, state, port := loopbackStart(t, env, key)
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		t.Fatalf("授权地址不可解析: %v", err)
+	}
+	if parsed.Path != "/code/authorize" {
+		t.Fatalf("授权地址 path = %q", parsed.Path)
+	}
+	q := parsed.Query()
+	if q.Get("desktop_callback") != "loopback" {
+		t.Fatalf("应带 desktop_callback=loopback: %s", rawURL)
+	}
+	if q.Get("redirect") != fmt.Sprintf("http://127.0.0.1:%d/auth/callback", port) {
+		t.Fatalf("redirect = %q", q.Get("redirect"))
+	}
+	if q.Get("state") != state {
+		t.Fatalf("授权地址 state 与返回值不一致")
+	}
+
+	if code, out := loopbackStatus(t, env, key, state); code != http.StatusOK || out["status"] != "pending" {
+		t.Fatalf("回调前 status = %d %v", code, out)
+	}
+
+	// 模拟浏览器回跳：真实请求 127.0.0.1 监听器。
+	cb, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/auth/callback?code=CODE-1&state=%s", port, url.QueryEscape(state)))
+	if err != nil {
+		t.Fatalf("请求回跳监听器失败: %v", err)
+	}
+	body, _ := io.ReadAll(cb.Body)
+	cb.Body.Close()
+	if cb.StatusCode != http.StatusOK || !strings.Contains(string(body), "登录成功") {
+		t.Fatalf("回跳响应 = %d %s", cb.StatusCode, body)
+	}
+
+	code, out := loopbackStatus(t, env, key, state)
+	if code != http.StatusOK || out["status"] != "success" || out["id"] != "user-7615755" {
+		t.Fatalf("回调后 status = %d %v", code, out)
+	}
+
+	// 账号已落库。
+	accounts := readAccountsFile(t, env.s.cfg.Accounts.AccountsFile())
+	count := 0
+	for _, a := range accounts {
+		var id string
+		_ = json.Unmarshal(a["id"], &id)
+		if id == "user-7615755" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("应落一条 user-7615755，实际 %d 条", count)
+	}
+
+	// state 已被监听器消费：手动 exchange 同 state → 400。
+	status, data := env.loginExchange(t, key, fmt.Sprintf(`{"code":"C2","state":%q}`, state))
+	if status != http.StatusBadRequest {
+		t.Fatalf("已消费 state 的 exchange = %d, 期望 400, body=%s", status, data)
+	}
+
+	// 重复回调：监听器已落定收摊（端口关闭）或竞态窗口内 409，都不再受理。
+	cb2, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/auth/callback?code=CODE-2&state=%s", port, url.QueryEscape(state)))
+	if err == nil {
+		cb2.Body.Close()
+		if cb2.StatusCode != http.StatusConflict {
+			t.Fatalf("重复回调 = %d, 期望 409", cb2.StatusCode)
+		}
+	}
+}
+
+// state 不匹配 → 400 且保持 pending；error 参数 → failed。
+func TestLoginLoopbackRejectsAndFails(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-loopback-reject"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	_, state, port := loopbackStart(t, env, key)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/auth/callback?code=X&state=wrong", port))
+	if err != nil {
+		t.Fatalf("请求回跳监听器失败: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("错误 state = %d, 期望 400", resp.StatusCode)
+	}
+	if code, out := loopbackStatus(t, env, key, state); code != http.StatusOK || out["status"] != "pending" {
+		t.Fatalf("错误 state 后应保持 pending: %d %v", code, out)
+	}
+
+	resp2, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/auth/callback?state=%s&error=access_denied", port, url.QueryEscape(state)))
+	if err != nil {
+		t.Fatalf("请求回跳监听器失败: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("error 参数 = %d, 期望 400", resp2.StatusCode)
+	}
+	code, out := loopbackStatus(t, env, key, state)
+	if code != http.StatusOK || out["status"] != "failed" || out["error"] != "上游授权被拒绝" {
+		t.Fatalf("error 后 status = %d %v", code, out)
+	}
+}
+
+// 新的 start 顶掉旧的：旧 state 查不到。
+func TestLoginLoopbackSuperseded(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-loopback-sup"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	_, state1, _ := loopbackStart(t, env, key)
+	_, state2, _ := loopbackStart(t, env, key)
+
+	if code, _ := loopbackStatus(t, env, key, state1); code != http.StatusNotFound {
+		t.Fatalf("被顶掉的旧 state = %d, 期望 404", code)
+	}
+	if code, out := loopbackStatus(t, env, key, state2); code != http.StatusOK || out["status"] != "pending" {
+		t.Fatalf("新 state = %d %v", code, out)
+	}
+}
+
+// TTL 到点 → failed（登录超时）。
+func TestLoginLoopbackTimeout(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-loopback-ttl"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) {
+		cfg.Admin.APIKey = sp(key)
+		cfg.Login.StateTTLSeconds = ip(1)
+	})
+
+	_, state, _ := loopbackStart(t, env, key)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		code, out := loopbackStatus(t, env, key, state)
+		if code == http.StatusOK && out["status"] == "failed" {
+			if msg, _ := out["error"].(string); !strings.Contains(msg, "超时") {
+				t.Fatalf("超时原因 = %q", msg)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("3s 内未落定为 failed: %d %v", code, out)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// login.enabled=false → 403。
+func TestLoginLoopbackDisabled(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-loopback-dis"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) {
+		cfg.Admin.APIKey = sp(key)
+		cfg.Login.Enabled = bp(false)
+	})
+	resp, data := env.writeReq(t, http.MethodPost, "/admin/api/login/loopback/start", "", key)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(data), "网页登录已禁用") {
+		t.Fatalf("disabled start = %d %s", resp.StatusCode, data)
 	}
 }

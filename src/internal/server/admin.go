@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +38,12 @@ func (s *Server) handleAdminAPI(w http.ResponseWriter, r *http.Request) {
 		s.adminLoginStart(w, r)
 	case "/admin/api/login/exchange":
 		s.adminLoginExchange(w, r)
+	case "/admin/api/login/loopback/start":
+		s.adminLoginLoopbackStart(w, r)
+	case "/admin/api/login/loopback/status":
+		s.adminLoginLoopbackStatus(w, r)
+	case "/admin/api/accounts/import-desktop":
+		s.adminImportDesktopAccount(w, r)
 	default:
 		if id, action, ok := accountSubPath(r.URL.Path); ok {
 			s.adminAccountByID(w, r, id, action)
@@ -464,9 +471,11 @@ func (s *Server) accountBalance(view pool.AccountView) map[string]any {
 		if raw, err := s.client.Entitlement(ctx, token); err == nil {
 			var ent struct {
 				Office struct {
-					ProEnable  *bool `json:"pro_enable"`
-					ActivePlan *struct {
-						Type string `json:"type"`
+					ProEnable      *bool           `json:"pro_enable"`
+					ProExpiredTime json.RawMessage `json:"pro_expired_time"`
+					ActivePlan     *struct {
+						Type                  string          `json:"type"`
+						SubscriptionExpiredAt json.RawMessage `json:"subscription_expired_at"`
 					} `json:"active_plan"`
 				} `json:"office"`
 			}
@@ -477,12 +486,122 @@ func (s *Server) accountBalance(view pool.AccountView) map[string]any {
 				if ent.Office.ActivePlan != nil {
 					subscription["office_active_plan_type"] = ent.Office.ActivePlan.Type
 				}
+				// 会员到期时间（raccoon 口径）：pro_expired_time 优先，
+				// 回落 active_plan.subscription_expired_at；仅 Pro 时展示。
+				if ent.Office.ProEnable != nil && *ent.Office.ProEnable {
+					until := parseTimeAny(ent.Office.ProExpiredTime)
+					if until == 0 && ent.Office.ActivePlan != nil {
+						until = parseTimeAny(ent.Office.ActivePlan.SubscriptionExpiredAt)
+					}
+					if until > 0 {
+						subscription["office_pro_until"] = until
+					}
+				}
 			}
 		}
 		entry["subscription"] = subscription
+		var avail int64
+		if balance.AvailablePoints != nil {
+			avail = *balance.AvailablePoints
+		}
+		entry["credits"] = s.accountCredits(token, avail)
 	}
 	balanceCacheMu.Lock()
 	balanceCache[view.ID] = balanceCacheEntry{at: time.Now(), value: entry}
 	balanceCacheMu.Unlock()
 	return entry
+}
+
+// billsScanLimit 是积分构成分析的账单读取条数（账单接口忽略 offset、total 恒为 0，
+// 只能要最新的 N 条；1000 覆盖活跃账号一天的发放，不够时按 raccoon 经验升到 5000）。
+const (
+	billsScanLimit    = 1000
+	billsScanLimitMax = 5000
+)
+
+// accountCredits 用账单分析积分的发放与到期构成（/admin/api/accounts/balance 的
+// credits 字段）。查询失败时只带 error，不影响积分卡其余字段。
+func (s *Server) accountCredits(token string, available int64) map[string]any {
+	ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Upstream.BillsTimeout())
+	defer cancel()
+	bills, err := s.client.Bills(ctx, token, billsScanLimit)
+	if err == nil && len(bills) >= billsScanLimit {
+		bills, err = s.client.Bills(ctx, token, billsScanLimitMax)
+	}
+	if err != nil {
+		return map[string]any{"error": err.Error()}
+	}
+	credits := analyzeCredits(bills, available, time.Now())
+	payload := map[string]any{
+		"granted_points":  credits.GrantedPoints,
+		"expiring_points": credits.ExpiringPoints,
+		"bills_scanned":   credits.BillsScanned,
+	}
+	if credits.UsedPoints != nil {
+		payload["used_points"] = *credits.UsedPoints
+	}
+	if credits.ExpiringAt != 0 {
+		payload["expiring_at"] = credits.ExpiringAt
+	}
+	return payload
+}
+
+// ── 桌面端登录态导入（只读复用 ~/.box-agent/config/auth.json）──
+
+// adminImportDesktopAccount 实现 POST /admin/api/accounts/import-desktop。
+//
+// 只取桌面端的 access_token：绝不读取、更不动用桌面端自己的 refresh_token
+//（那会轮换掉客户端的会话）。落成 source=desktop 的「活席」账号——每次取
+// token 前自动同步本机 auth.json 的新 token（见 pool.syncDesktop）。同 id
+// 重复导入 = 更新 token，且 Upsert 对空 refresh_token 不覆盖旧值，不会碰掉
+// 手动登录留下的刷新令牌。
+func (s *Server) adminImportDesktopAccount(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !s.requireAdminWrite(w) {
+		return
+	}
+	auth, err := pool.ReadDesktopAuth()
+	if err != nil {
+		s.logger.Warnf("[admin] 桌面端登录态不可读：%v", err)
+		code, message := "desktop_auth_invalid", err.Error()
+		if errors.Is(err, os.ErrNotExist) {
+			code = "desktop_auth_missing"
+			message = "未检测到本机桌面端登录态（" + pool.DesktopAuthPath() + "）。请先打开商汤小浣熊客户端登录；容器部署时该文件在宿主机上，需改用手动添加。"
+		}
+		writeError(w, http.StatusBadRequest, apiError{
+			Message: message,
+			Type:    typeInvalidRequest,
+			Code:    code,
+		})
+		return
+	}
+	access := auth.AccessToken
+	account := &pool.Account{
+		ID:          accountIDFromToken(access),
+		UserID:      auth.UserID,
+		AccessToken: access,
+		ExpiresAt:   auth.ExpiresAt,
+		Source:      "desktop",
+		Enabled:     true,
+		Priority:    100,
+	}
+	updated, err := s.pool.Upsert(account)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, apiError{
+			Message: "回写账号文件失败：" + err.Error(),
+			Type:    typeUpstream,
+			Code:    "persist_failed",
+		})
+		return
+	}
+	s.logger.Infof("[admin] 导入桌面端登录态 %s updated=%v", account.ID, updated)
+	view, _ := s.pool.View(account.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id":      account.ID,
+		"updated": updated,
+		"account": view,
+	})
 }

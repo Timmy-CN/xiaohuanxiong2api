@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/base64"
 	"encoding/json"
+	"math/big"
 	"strconv"
 	"strings"
 )
@@ -40,7 +41,10 @@ func JWTExpiry(token string) int64 {
 
 // JWTUserID 解码 JWT payload 里的用户 id（不验签）。
 //
-// 依次尝试 user_id / userId / uid / userID；解析不出返回空串（SPEC4 §G.2）。
+// 商汤小浣熊签发的 JWT 把用户 id 放在 sid / iss（十六进制串，如 "74350b" 即
+// 十进制 7615755），先按十六进制转十进制；非十六进制串（如 iss 是 URL）或转换
+// 失败则回落为直接取值：依次尝试 user_id / userId / uid / userID / sub / id，
+// 解析不出返回空串（SPEC4 §G.2）。
 func JWTUserID(token string) string {
 	token = strings.TrimSpace(strings.TrimPrefix(token, "Bearer "))
 	parts := strings.Split(token, ".")
@@ -58,7 +62,15 @@ func JWTUserID(token string) string {
 	if err := json.Unmarshal(payload, &claims); err != nil {
 		return ""
 	}
-	for _, key := range []string{"user_id", "userId", "uid", "userID"} {
+	for _, key := range []string{"sid", "iss"} {
+		var text string
+		if raw, ok := claims[key]; ok && json.Unmarshal(raw, &text) == nil {
+			if dec := hexIDToDecimal(text); dec != "" {
+				return dec
+			}
+		}
+	}
+	for _, key := range []string{"user_id", "userId", "uid", "userID", "sub", "id"} {
 		raw, ok := claims[key]
 		if !ok {
 			continue
@@ -75,6 +87,28 @@ func JWTUserID(token string) string {
 		}
 	}
 	return ""
+}
+
+// hexIDToDecimal 把十六进制 id 串转成十进制字符串；空串、含非十六进制字符或
+// 解析失败返回空串。接受可选的 0x / 0X 前缀。
+func hexIDToDecimal(value string) string {
+	raw := strings.TrimSpace(value)
+	if len(raw) >= 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X') {
+		raw = raw[2:]
+	}
+	if raw == "" {
+		return ""
+	}
+	for _, r := range raw {
+		if !strings.ContainsRune("0123456789abcdefABCDEF", r) {
+			return ""
+		}
+	}
+	n, ok := new(big.Int).SetString(raw, 16)
+	if !ok {
+		return ""
+	}
+	return n.String()
 }
 
 // TokenTail 返回 token 的最后 4 个字符（不足则整体返回）。

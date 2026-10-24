@@ -66,6 +66,9 @@ func newTestEnv(t *testing.T, handler http.HandlerFunc, accounts []map[string]an
 	cfg.Upstream.LLMBase = sp(upstreamServer.URL)
 	cfg.Upstream.AuthBase = sp(upstreamServer.URL)
 	cfg.Upstream.PointsBase = sp(upstreamServer.URL)
+	// Origin 也指向桩上游：账单（/api/web/points/v1/bills）等挂在 Origin 下，
+	// 授权页 URL 断言只看 path 与 query，不受 host 影响。
+	cfg.Upstream.Origin = sp(upstreamServer.URL)
 	cfg.Models.CatalogCacheFile = sp(filepath.Join(t.TempDir(), "catalog.json"))
 	cfg.Upstream.RequestTimeoutSeconds = ip(0)
 	cfg.Log.AccessLog = bp(false)
@@ -523,8 +526,9 @@ func TestCatalogRemoteFailureUsesCache(t *testing.T) {
 	}
 }
 
-// TestCatalogNoCacheIsEmpty 覆盖「远程失败且无缓存 → 目录为空（来源 empty）」。
-func TestCatalogNoCacheIsEmpty(t *testing.T) {
+// TestCatalogNoCacheFallsBack 覆盖「远程失败且无缓存 → 展示内置兜底表」。
+// 真实目录仍为空（Empty()），模型校验保持「目录为空跳过」的口径。
+func TestCatalogNoCacheFallsBack(t *testing.T) {
 	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", 500)
 	}))
@@ -537,23 +541,36 @@ func TestCatalogNoCacheIsEmpty(t *testing.T) {
 	if err := catalog.Refresh(context.Background(), ""); err == nil {
 		t.Fatal("远程失败时 Refresh 应返回错误")
 	}
-	if models := catalog.Models(""); len(models) != 0 {
-		t.Fatalf("无缓存时应为空，实际: %+v", models)
+	if catalog.Empty() == false {
+		t.Fatal("远程失败且无缓存时真实目录应为空")
 	}
-	if catalog.Source() != "empty" {
-		t.Fatalf("来源 = %q, 期望 empty", catalog.Source())
+	models := catalog.Models("")
+	if len(models) == 0 {
+		t.Fatal("真实目录为空时应展示兜底表")
+	}
+	ids := map[string]bool{}
+	for _, m := range models {
+		ids[m.ID] = true
+	}
+	for _, want := range []string{"sn-glm-5-3-flash", "sn-kimi-k3", "raccoon-chat-ml-5-5"} {
+		if !ids[want] {
+			t.Fatalf("兜底表缺模型 %s: %v", want, ids)
+		}
+	}
+	if catalog.Source() != "fallback" {
+		t.Fatalf("来源 = %q, 期望 fallback", catalog.Source())
 	}
 }
 
-// TestModelsEndpointEmptyCatalog 覆盖「目录为空时 /v1/models 返回 200 + 空 data」。
-func TestModelsEndpointEmptyCatalog(t *testing.T) {
+// TestModelsEndpointFallbackCatalog 覆盖「目录不可用时 /v1/models 退回兜底表」。
+func TestModelsEndpointFallbackCatalog(t *testing.T) {
 	handler := func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", 500)
 	}
 	env := newTestEnv(t, handler, nil, nil)
-	// newTestEnv 不加载缓存/刷新，目录天然为空。
-	if env.s.catalog.Count() != 0 {
-		t.Fatalf("测试前置：目录应为空，实际 %d", env.s.catalog.Count())
+	// newTestEnv 不加载缓存/刷新，真实目录为空 → 兜底表生效。
+	if !env.s.catalog.Empty() {
+		t.Fatalf("测试前置：真实目录应为空")
 	}
 
 	resp, err := http.Get(env.hs.URL + "/v1/models")
@@ -575,10 +592,13 @@ func TestModelsEndpointEmptyCatalog(t *testing.T) {
 	if payload.Object != "list" {
 		t.Fatalf("object = %q, 期望 list", payload.Object)
 	}
-	if len(payload.Data) != 0 {
-		t.Fatalf("空目录 data 应为空数组: %s", data)
+	ids := map[string]bool{}
+	for _, entry := range payload.Data {
+		ids[entry["id"].(string)] = true
 	}
-	if !strings.Contains(string(data), `"data":[]`) {
-		t.Fatalf("空目录应输出 data:[]，实际: %s", data)
+	for _, want := range []string{"sn-glm-5-3-flash", "raccoon-chat-ml-5-5"} {
+		if !ids[want] {
+			t.Fatalf("兜底目录缺模型 %s: %s", want, data)
+		}
 	}
 }

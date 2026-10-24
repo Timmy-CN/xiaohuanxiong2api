@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,14 @@ import (
 func testJWTUser(exp int64, userID string) string {
 	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
 	raw, _ := json.Marshal(map[string]any{"exp": exp, "user_id": userID})
+	payload := base64.RawURLEncoding.EncodeToString(raw)
+	return header + "." + payload + ".sig"
+}
+
+// testJWTiss 造一个含 exp 与十六进制 iss 的假 JWT（真实小浣熊签发形态）。
+func testJWTiss(exp int64, iss string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	raw, _ := json.Marshal(map[string]any{"exp": exp, "iss": iss})
 	payload := base64.RawURLEncoding.EncodeToString(raw)
 	return header + "." + payload + ".sig"
 }
@@ -328,5 +337,186 @@ func TestAdminWriteQueryKeyAuth(t *testing.T) {
 	resp, data := env.writeReq(t, http.MethodPatch, "/admin/api/accounts/a1?key="+key, `{"enabled":false}`, "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("?key= 写操作状态码 = %d, 期望 200, body=%s", resp.StatusCode, data)
+	}
+}
+
+// ── 桌面端登录态导入 ──
+
+// 首次导入：从 auth.json 取 access_token 落账号，id 取自 hex iss，不带 refresh_token。
+func TestImportDesktopAccount(t *testing.T) {
+	dir := t.TempDir()
+	access := testJWTiss(time.Now().Add(2*time.Hour).Unix(), "74350b")
+	authJSON := fmt.Sprintf(`{"access_token": %q, "refresh_token": "desktop-rt"}`, access)
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatalf("预写 auth.json 失败: %v", err)
+	}
+	t.Setenv("RACCOON_BOX_AGENT_CONFIG_DIR", dir)
+	t.Setenv("BOX_AGENT_CONFIG_DIR", "")
+
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-import"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	resp, data := env.writeReq(t, http.MethodPost, "/admin/api/accounts/import-desktop", "", key)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("导入状态码 = %d, body=%s", resp.StatusCode, data)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	if out["id"] != "user-7615755" || out["updated"] != false {
+		t.Fatalf("导入结果 = %v", out)
+	}
+	accounts := readAccountsFile(t, env.s.cfg.Accounts.AccountsFile())
+	if len(accounts) != 1 {
+		t.Fatalf("应只落一条账号, 实际 %d", len(accounts))
+	}
+	var hasRefresh bool
+	_ = json.Unmarshal(accounts[0]["has_refresh_token"], &hasRefresh)
+	if hasRefresh {
+		t.Fatal("桌面端导入不应带 refresh_token（避免顶掉客户端会话）")
+	}
+	var source string
+	_ = json.Unmarshal(accounts[0]["source"], &source)
+	if source != "desktop" {
+		t.Fatalf("source = %q, 期望 desktop（活席标记）", source)
+	}
+
+	// 同 id 再导入 = 更新。
+	resp2, data2 := env.writeReq(t, http.MethodPost, "/admin/api/accounts/import-desktop", "", key)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("二次导入状态码 = %d, body=%s", resp2.StatusCode, data2)
+	}
+	var out2 map[string]any
+	_ = json.Unmarshal(data2, &out2)
+	if out2["updated"] != true {
+		t.Fatalf("二次导入 updated = %v, 期望 true", out2["updated"])
+	}
+	accounts = readAccountsFile(t, env.s.cfg.Accounts.AccountsFile())
+	if len(accounts) != 1 {
+		t.Fatalf("二次导入不应新增账号, 实际 %d", len(accounts))
+	}
+}
+
+// 已有同 id 手动账号（带 refresh_token）→ 导入只更新 token，refresh_token 保留。
+func TestImportDesktopKeepsRefreshToken(t *testing.T) {
+	dir := t.TempDir()
+	// 0x73d2e3 = 7590627，与手动账号同 id（user-7590627）。
+	access := testJWTiss(time.Now().Add(2*time.Hour).Unix(), "73d2e3")
+	authJSON := fmt.Sprintf(`{"access_token": %q}`, access)
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(authJSON), 0o600); err != nil {
+		t.Fatalf("预写 auth.json 失败: %v", err)
+	}
+	t.Setenv("RACCOON_BOX_AGENT_CONFIG_DIR", dir)
+	t.Setenv("BOX_AGENT_CONFIG_DIR", "")
+
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-import-keep"
+	env := newTestEnv(t, handler, []map[string]any{{
+		"id": "user-7590627", "name": "手动", "access_token": testJWTUser(time.Now().Add(time.Hour).Unix(), "7590627"),
+		"refresh_token": "rt-keep", "enabled": true, "priority": 1,
+	}}, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	resp, data := env.writeReq(t, http.MethodPost, "/admin/api/accounts/import-desktop", "", key)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("导入状态码 = %d, body=%s", resp.StatusCode, data)
+	}
+	var out map[string]any
+	_ = json.Unmarshal(data, &out)
+	if out["updated"] != true {
+		t.Fatalf("同 id 导入 updated = %v, 期望 true", out["updated"])
+	}
+	accounts := readAccountsFile(t, env.s.cfg.Accounts.AccountsFile())
+	var refresh string
+	_ = json.Unmarshal(accounts[0]["refresh_token"], &refresh)
+	if refresh != "rt-keep" {
+		t.Fatalf("refresh_token = %q, 期望保留 rt-keep", refresh)
+	}
+}
+
+// auth.json 缺失 → 400 并带说明。
+func TestImportDesktopMissing(t *testing.T) {
+	t.Setenv("RACCOON_BOX_AGENT_CONFIG_DIR", t.TempDir())
+	t.Setenv("BOX_AGENT_CONFIG_DIR", "")
+
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	const key = "k-import-miss"
+	env := newTestEnv(t, handler, nil, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	resp, data := env.writeReq(t, http.MethodPost, "/admin/api/accounts/import-desktop", "", key)
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(data), "未检测到本机桌面端登录态") {
+		t.Fatalf("缺失 auth.json = %d %s", resp.StatusCode, data)
+	}
+}
+
+// admin.api_key 未设置 → 403。
+func TestImportDesktopRequiresKey(t *testing.T) {
+	t.Setenv("RACCOON_BOX_AGENT_CONFIG_DIR", t.TempDir())
+	t.Setenv("BOX_AGENT_CONFIG_DIR", "")
+
+	handler := func(w http.ResponseWriter, r *http.Request) { http.NotFound(w, r) }
+	env := newTestEnv(t, handler, nil, nil)
+	resp, data := env.writeReq(t, http.MethodPost, "/admin/api/accounts/import-desktop", "", "")
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("无 key 导入 = %d, 期望 403, body=%s", resp.StatusCode, data)
+	}
+}
+
+// ── 积分构成（/admin/api/accounts/balance 的 credits 字段）──
+
+func TestBalanceIncludesCredits(t *testing.T) {
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/balance":
+			writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{"available_points": 2000}})
+		case "/entitlement_info":
+			writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{
+				"office": map[string]any{"pro_enable": true, "pro_expired_time": 1790000000000},
+			}})
+		case "/api/web/points/v1/bills":
+			writeJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{"items": []map[string]any{
+				{"bill_id": "b1", "points": 300, "created_at": "2026-10-09T00:00:17+08:00", "expire_at": "2027-01-15T00:00:00+08:00"},
+				{"bill_id": "b2", "points": 3000, "created_at": "2026-10-09T00:00:17+08:00", "expire_at": "2026-12-01T00:00:00+08:00"},
+				{"bill_id": "b3", "points": -50, "created_at": "2026-10-09T00:00:17+08:00"},
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}
+	const key = "k-balance-credits"
+	env := newTestEnv(t, handler, []map[string]any{{
+		"id": "user-9900773", "name": "积", "access_token": "tok", "enabled": true, "priority": 1,
+	}}, func(cfg *config.Config) { cfg.Admin.APIKey = sp(key) })
+
+	resp, data := env.writeReq(t, http.MethodGet, "/admin/api/accounts/balance", "", key)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("balance 状态码 = %d, body=%s", resp.StatusCode, data)
+	}
+	var list []map[string]any
+	if err := json.Unmarshal(data, &list); err != nil || len(list) != 1 {
+		t.Fatalf("balance 响应 = %s", data)
+	}
+	credits, _ := list[0]["credits"].(map[string]any)
+	if credits == nil {
+		t.Fatalf("缺 credits 字段: %s", data)
+	}
+	if credits["granted_points"] != float64(3300) {
+		t.Fatalf("granted_points = %v, 期望 3300", credits["granted_points"])
+	}
+	if credits["expiring_points"] != float64(3000) {
+		t.Fatalf("expiring_points = %v, 期望 3000（2026-12-01 更早）", credits["expiring_points"])
+	}
+	if credits["used_points"] != float64(1300) {
+		t.Fatalf("used_points = %v, 期望 1300", credits["used_points"])
+	}
+	wantAt := time.Date(2026, 12, 1, 0, 0, 0, 0, beijingLoc).UnixMilli()
+	if credits["expiring_at"] != float64(wantAt) {
+		t.Fatalf("expiring_at = %v, 期望 %d", credits["expiring_at"], wantAt)
+	}
+	subscription, _ := list[0]["subscription"].(map[string]any)
+	if subscription == nil || subscription["office_pro_enable"] != true {
+		t.Fatalf("subscription 缺 pro_enable: %s", data)
+	}
+	if subscription["office_pro_until"] != float64(1790000000000) {
+		t.Fatalf("office_pro_until = %v, 期望 1790000000000", subscription["office_pro_until"])
 	}
 }

@@ -2,7 +2,7 @@
 data/
 
 # 实际配置（含密钥）——只提交 config.example.json
-config.json
+src/config.json
 
 # 提示词脚手架
 SPEC.md
@@ -19,3 +19,4 @@ bin/
 *.log
 *.bak
 *.tmp
+.idea

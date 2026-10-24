@@ -76,6 +76,7 @@ type Bill struct {
 	BizType    string `json:"biz_type"`
 	Points     int64  `json:"points"`
 	CreatedAt  string `json:"created_at"`
+	ExpireAt   string `json:"expire_at"`
 }
 
 // Bills 查询积分账单（GET {origin}/api/web/points/v1/bills?paging.limit=N&paging.offset=0）。
@@ -108,4 +109,61 @@ func (c *Client) Bills(ctx context.Context, token string, limit int) ([]Bill, er
 		return nil, fmt.Errorf("查询积分账单失败: code=%d message=%s", *resp.Code, resp.Message)
 	}
 	return resp.Data.Items, nil
+}
+
+// OnboardingGrant 是一次性桌面端首登奖励的领取结果。
+type OnboardingGrant struct {
+	Granted bool  // data.granted：true=本次发放；false=该账号早已领取（一次性已结算）
+	Points  int64 // 本次发放的积分（popup.points）；granted=false 时为 0
+}
+
+// ClaimOnboardingGrant 领取一次性桌面端首登奖励
+// （POST {origin}/api/web/desktop/v1/login/points/grant）。
+//
+// 每个账号只发放一次（实测 +3000）：granted=true 表示本次发放，popup.points 为
+// 实发积分（缺失时按 3000 计）；granted=false 表示早已领取过，调用方可视为已结算。
+// 请求头与 setting_info 同为桌面端形态；超时沿用 balance_timeout_seconds。
+func (c *Client) ClaimOnboardingGrant(ctx context.Context, token string) (*OnboardingGrant, error) {
+	url := c.opts.Origin + "/api/web/desktop/v1/login/points/grant"
+	headers := map[string]string{
+		"Accept":            "application/json",
+		"X-Client-Platform": "desktop-windows",
+		"X-Client-Version":  "v1.0.0",
+	}
+	status, data, err := c.doJSON(ctx, http.MethodPost, url, nil, token, headers, c.opts.BalanceTimeout, maxCatalogBytes)
+	if err != nil {
+		return nil, fmt.Errorf("领取首登奖励失败: %w", err)
+	}
+	if status < 200 || status >= 300 {
+		return nil, &StatusError{Status: status, Message: jsonMessage(data)}
+	}
+	var resp struct {
+		Code    *int   `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			Granted *bool           `json:"granted"`
+			Popup   json.RawMessage `json:"popup"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("解析首登奖励响应失败: %w", err)
+	}
+	if resp.Code != nil && *resp.Code != 0 {
+		return nil, fmt.Errorf("领取首登奖励失败: code=%d message=%s", *resp.Code, resp.Message)
+	}
+	var popup struct {
+		Points json.RawMessage `json:"points"`
+	}
+	if len(resp.Data.Popup) > 0 {
+		_ = json.Unmarshal(resp.Data.Popup, &popup)
+	}
+	points := int64(0)
+	if pts := flexInt(popup.Points); pts != nil {
+		points = *pts
+	}
+	granted := resp.Data.Granted != nil && *resp.Data.Granted
+	if granted && points <= 0 {
+		points = 3000
+	}
+	return &OnboardingGrant{Granted: granted, Points: points}, nil
 }

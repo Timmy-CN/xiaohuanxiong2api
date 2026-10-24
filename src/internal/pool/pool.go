@@ -42,6 +42,9 @@ type Account struct {
 	LastRefreshAt int64  `json:"last_refresh_at"`
 	CooldownUntil int64  `json:"cooldown_until"`
 	LastError     string `json:"last_error"`
+	// desktop = 从桌面端登录态导入的「活席」：每次取 token 前先同步本机
+	// auth.json，只接管同一账号的更新 token。网页登录会清掉该标记。
+	Source string `json:"source,omitempty"`
 
 	extra map[string]json.RawMessage
 }
@@ -284,12 +287,54 @@ func (p *Pool) Pick(exclude map[string]bool) *Account {
 	return chosen.clone()
 }
 
+// syncDesktop 是「桌面端活席」：source=desktop 的账号在取 token 前先读本机
+// 桌面客户端登录态（auth.json），只接管同一账号的更新 token——raccoon 插件
+// #166 的教训：绝不拿客户端当前登录的其他账号代答。账号无 uid、客户端未登录
+// 或 token 没有更新时静默跳过；磁盘 IO 全部在锁外。
+func (p *Pool) syncDesktop(id string) {
+	p.mu.Lock()
+	account := p.findLocked(id)
+	if account == nil || account.Source != "desktop" || !account.Enabled {
+		p.mu.Unlock()
+		return
+	}
+	curToken, curExpires, userID := account.AccessToken, account.ExpiresAt, account.UserID
+	p.mu.Unlock()
+
+	auth, err := ReadDesktopAuth()
+	if err != nil || auth.AccessToken == "" || auth.AccessToken == curToken {
+		return
+	}
+	if userID == "" || auth.UserID == "" || auth.UserID != userID {
+		return
+	}
+	if auth.ExpiresAt > 0 && curExpires > 0 && auth.ExpiresAt < curExpires {
+		return // 文件里的 token 更旧
+	}
+
+	p.mu.Lock()
+	account = p.findLocked(id)
+	if account == nil || account.Source != "desktop" || account.AccessToken != curToken {
+		p.mu.Unlock()
+		return
+	}
+	account.AccessToken = auth.AccessToken
+	if auth.ExpiresAt > 0 {
+		account.ExpiresAt = auth.ExpiresAt
+	}
+	account.LastError = ""
+	p.mu.Unlock()
+	p.persist()
+	p.logger.Infof("[pool] 账号 %s 已接管桌面端登录态的新 token", id)
+}
+
 // Token 返回指定账号当前可用的 access_token。
 //
 // force=false 时仅在临期（expires_at > 0 且 now+margin >= expires_at）时刷新；
 // force=true 时无条件刷新（401 后的强制刷新）。刷新失败不覆盖旧 token，记录
 // last_error 并返回错误。同一账号的并发刷新只发一次真实请求（单飞）。
 func (p *Pool) Token(ctx context.Context, id string, force bool) (string, error) {
+	p.syncDesktop(id)
 	p.mu.Lock()
 	account := p.findLocked(id)
 	if account == nil {
@@ -511,6 +556,7 @@ func (p *Pool) Upsert(account *Account) (bool, error) {
 		}
 		existing.ExpiresAt = account.ExpiresAt
 		existing.UserID = account.UserID
+		existing.Source = account.Source
 		existing.LastError = ""
 		for key, value := range account.extra {
 			if existing.extra == nil {
@@ -593,8 +639,9 @@ func (p *Pool) TestToken(ctx context.Context, id string) (int, int, error) {
 	return p.client.CatalogProbe(ctx, token)
 }
 
-// TokenFor 返回账号当前 token（不刷新），供只读查询使用；不存在返回空串。
+// TokenFor 返回账号当前 token（不刷新），供只读查询使用；不存在则空串。
 func (p *Pool) TokenFor(id string) string {
+	p.syncDesktop(id)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if account := p.findLocked(id); account != nil {

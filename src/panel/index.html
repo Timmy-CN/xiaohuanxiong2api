@@ -198,7 +198,9 @@
   <h2>账号池</h2>
   <div class="toolbar">
     <button id="toggle-login" class="btn" type="button" aria-expanded="false" aria-controls="login-box">网页登录</button>
+    <button id="toggle-loopback" class="btn" type="button" aria-expanded="false" aria-controls="loopback-box">自动回跳登录</button>
     <button id="toggle-add" class="btn" type="button" aria-expanded="false" aria-controls="add-account-form">手动添加账号</button>
+    <button id="import-desktop" class="btn" type="button">导入桌面端登录态</button>
     <span id="accounts-msg" class="form-msg"></span>
   </div>
   <div id="login-box" class="login-box" hidden>
@@ -216,6 +218,22 @@
       <button id="login-submit" class="btn primary" type="button">完成登录</button>
     </div>
     <div id="login-msg" class="form-msg"></div>
+  </div>
+  <div id="loopback-box" class="login-box" hidden>
+    <div class="row">
+      <a id="loopback-link" href="#" target="_blank" rel="noopener noreferrer">打开小浣熊登录页（自动回跳）</a>
+      <button id="loopback-copy" class="btn" type="button">复制链接</button>
+      <span id="loopback-ttl" class="ttl"></span>
+    </div>
+    <div class="hint">
+      点开上面链接完成登录并确认授权，浏览器会自动跳回本服务完成登录，无需手动粘贴。
+      仅当浏览器与本服务<strong>同机</strong>（能访问其 127.0.0.1）时可用；
+      容器/远程部署请改用「网页登录」手动粘贴。
+    </div>
+    <div class="row">
+      <span id="loopback-status" class="ttl"></span>
+    </div>
+    <div id="loopback-msg" class="form-msg"></div>
   </div>
   <form id="add-account-form" class="add-form" hidden>
     <div class="field">
@@ -566,6 +584,7 @@
   // 用 hidden 属性控制显隐（CSS 对 [hidden] 做了兜底），并同步 .active / aria-expanded。
   var PANELS = [
     { btn: "toggle-login", body: "login-box" },
+    { btn: "toggle-loopback", body: "loopback-box" },
     { btn: "toggle-add", body: "add-account-form" }
   ];
 
@@ -727,6 +746,107 @@
     });
   })();
 
+  // ── 2d. 自动回跳登录 ──
+  (function wireLoopback() {
+    var link = document.getElementById("loopback-link");
+    var ttlEl = document.getElementById("loopback-ttl");
+    var statusEl = document.getElementById("loopback-status");
+    var copyBtn = document.getElementById("loopback-copy");
+    var state = "";
+    var pollTimer = null;
+
+    function showMsg(msg, isErr) {
+      var el = document.getElementById("loopback-msg");
+      el.textContent = msg || "";
+      el.className = "form-msg " + (isErr ? "err" : "ok");
+    }
+
+    function stopPoll() {
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    }
+
+    function poll() {
+      if (!state) return;
+      getJSON("/admin/api/login/loopback/status?state=" + encodeURIComponent(state))
+        .then(function (res) {
+          var st = (res && res.status) || "";
+          if (st === "success") {
+            statusEl.textContent = "已结束";
+            showMsg("登录成功：" + ((res && res.id) || ""), false);
+            showAccountsMsg("登录成功：" + ((res && res.id) || ""), false);
+            state = "";
+            loadAccounts();
+            setPanel("loopback-box", false);
+          } else if (st === "failed") {
+            statusEl.textContent = "已结束";
+            showMsg((res && res.error) || "登录失败，请重试", true);
+            state = "";
+          } else {
+            statusEl.textContent = "等待授权回调…";
+            pollTimer = setTimeout(poll, 2000);
+          }
+        })
+        .catch(function () {
+          statusEl.textContent = "已结束";
+          showMsg("登录请求已失效或已过期，请重新发起", true);
+          state = "";
+        });
+    }
+
+    document.getElementById("toggle-loopback").addEventListener("click", function () {
+      if (panelOpen("loopback-box")) { setPanel("loopback-box", false); return; }
+      var btn = document.getElementById("toggle-loopback");
+      btn.disabled = true;
+      showMsg("");
+      statusEl.textContent = "";
+      stopPoll();
+      writeJSON("POST", "/admin/api/login/loopback/start")
+        .then(function (res) {
+          var url = (res && res.url) || "";
+          state = (res && res.state) || "";
+          link.setAttribute("href", url);
+          ttlEl.textContent = fmtTtl(res && res.ttl_seconds);
+          closeOtherPanels("loopback-box");
+          setPanel("loopback-box", true);
+          showMsg("请点开上面的链接完成登录；授权后本页会自动收到结果", false);
+          poll();
+        })
+        .catch(function (err) { showAccountsMsg(err.message, true); })
+        .then(function () { btn.disabled = false; });
+    });
+
+    copyBtn.addEventListener("click", function () {
+      var url = link.getAttribute("href") || "";
+      if (!url || url === "#") { showMsg("请先点「自动回跳登录」生成链接", true); return; }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).then(function () {
+          showMsg("已复制登录链接", false);
+        }, function () {
+          showMsg("复制失败，请手动选中链接复制", true);
+        });
+      } else {
+        showMsg("当前浏览器不支持自动复制，请手动选中链接复制", true);
+      }
+    });
+  })();
+
+  // ── 2e. 导入桌面端登录态 ──
+  (function wireImportDesktop() {
+    var btn = document.getElementById("import-desktop");
+    btn.addEventListener("click", function () {
+      btn.disabled = true;
+      showAccountsMsg("正在导入桌面端登录态…", false);
+      writeJSON("POST", "/admin/api/accounts/import-desktop")
+        .then(function (res) {
+          var verb = (res && res.updated) ? "已更新桌面端账号 " : "已导入桌面端账号 ";
+          showAccountsMsg(verb + ((res && res.id) || ""), false);
+          return loadAccounts();
+        })
+        .catch(function (err) { showAccountsMsg(err.message, true); })
+        .then(function () { btn.disabled = false; });
+    });
+  })();
+
   // ── 3. 积分卡 ──
   function loadBalance() {
     return getJSON("/admin/api/accounts/balance").then(function (list) {
@@ -788,9 +908,31 @@
           if (sub.office_pro_enable !== undefined) {
             var line = document.createElement("div");
             line.className = "sub";
-            line.textContent = "Office 会员：" + (sub.office_pro_enable ? "已开通" : "未开通") +
+            var label = "Office 会员：" + (sub.office_pro_enable ? "已开通" : "未开通") +
               (sub.office_active_plan_type ? "（" + sub.office_active_plan_type + "）" : "");
+            if (sub.office_pro_until) label += "，" + fmtTime(sub.office_pro_until) + " 到期";
+            line.textContent = label;
             card.appendChild(line);
+          }
+
+          var credits = b.credits || {};
+          if (credits.error) {
+            var ce = document.createElement("div");
+            ce.className = "sub";
+            ce.textContent = "积分构成查询失败：" + credits.error;
+            card.appendChild(ce);
+          } else {
+            var cparts = [];
+            if (credits.used_points !== undefined) cparts.push("已用 " + credits.used_points + " 积分");
+            if (credits.expiring_at) {
+              cparts.push(text(credits.expiring_points) + " 积分将于 " + fmtTime(credits.expiring_at) + " 过期");
+            }
+            if (cparts.length) {
+              var cl = document.createElement("div");
+              cl.className = "sub";
+              cl.textContent = cparts.join("；");
+              card.appendChild(cl);
+            }
           }
         }
         wrap.appendChild(card);

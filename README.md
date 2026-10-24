@@ -34,7 +34,7 @@ cp config.example.json config.json
 # 编辑 config.json（监听地址、api_key 等；不需要密钥时保持默认即可）
 ```
 
-`config.json` 支持 JSONC（`//`、`/* */` 注释与尾逗号）。**写错键名会启动失败**（未知键会报错）。
+`src/config.json` 支持 JSONC（`//`、`/* */` 注释与尾逗号）。**写错键名会启动失败**（未知键会报错）。
 
 ### 2. 准备账号
 
@@ -91,7 +91,7 @@ curl -sN -H 'Content-Type: application/json' \
 #   http://127.0.0.1:3066/admin
 ```
 
-> 若在 `config.json` 里设置了 `api_key`，上面 `/v1` 的请求要加 `-H 'Authorization: Bearer <api_key>'`；
+> 若在 `src/config.json` 里设置了 `api_key`，上面 `/v1` 的请求要加 `-H 'Authorization: Bearer <api_key>'`；
 > 若设置了 `admin.api_key`，面板地址要带 `?key=<admin_api_key>`。
 
 ---
@@ -148,7 +148,7 @@ curl -sN -H 'Content-Type: application/json' \
 | `catalog_cache_file` | `"./data/model_catalog.json"` | 目录持久化缓存文件；远程拉不到时用它。 |
 
 > 模型名一律用**上游 id**（`sn-glm-5-3-flash`、`sn-glm-5-3`、`sn-kimi-k3` 等），没有别名映射。
-> 目录来源优先级：内存（TTL 内）→ 持久化缓存文件 → 空（来源显示 `empty`，此时 `/v1/models` 返回空列表）。
+> 目录来源优先级：内存（TTL 内）→ 持久化缓存文件 → **内置兜底表**（来源显示 `fallback`，含上游已知模型与默认对话模型 `raccoon-chat-ml-5-5`）。目录正常时若缺默认对话模型也会自动补齐在列。
 
 ### `log`
 
@@ -242,6 +242,16 @@ curl -sN -H 'Content-Type: application/json' \
    - 在 **Network** 里找任意一个发往 `xiaohuanxiong.com` 的请求，复制请求头里的 `Authorization: Bearer eyJ…`，`eyJ…` 即 `access_token`；
    - `refresh_token` 通常在登录/刷新接口的响应里，或存放于 **Application → Local Storage / Cookies**（形如 `refresh_token`）。
 2. 或者使用官方桌面端：登录后 token 保存在 `~/.box-agent/config/auth.json`（`access_token` / `refresh_token`）。
+3. 本机装了官方桌面客户端时，也可以在面板点**「导入桌面端登录态」**（`POST /admin/api/accounts/import-desktop`）一键导入：
+
+   - 读取的是**运行 xhx2api 的机器**上的 `~/.box-agent/config/auth.json`，只取里面的 `access_token`；
+     目录可用环境变量 `RACCOON_BOX_AGENT_CONFIG_DIR` / `BOX_AGENT_CONFIG_DIR` 覆盖。
+   - **不会**读取、更不会动用桌面端自己的 `refresh_token`（那会轮换掉客户端的会话）。
+   - 导入的账号带 `source: "desktop"` 标记（**活席**）：每次取 token 前自动重读本机
+     `auth.json`，客户端重新登录后只要还是同一账号就会自动接管新 token（按 JWT 里的
+     用户 id 比对，绝不拿客户端当前的其他账号代答）；网页登录同一账号会清掉该标记。
+   - 同 id 重复导入 = 更新 token；对已有同 id 的手动账号只更新 `access_token`，不覆盖原 `refresh_token`。
+   - 容器部署时该文件在宿主机/桌面机上，容器内没有，仍走手动添加或网页登录。
 
 **务必注意：**
 
@@ -265,6 +275,9 @@ curl -sN -H 'Content-Type: application/json' \
 | POST/PATCH/DELETE | `/admin/api/accounts…` | `admin.api_key` | 账号管理写接口（见「面板管理账号」）。 |
 | POST | `/admin/api/login/start` | `admin.api_key` | 发起网页登录，返回授权页 URL 与 state（见「网页登录」）。 |
 | POST | `/admin/api/login/exchange` | `admin.api_key` | 用回调 URL（或 code+state）换凭证并落账号。 |
+| POST | `/admin/api/login/loopback/start` | `admin.api_key` | 发起「自动回跳」网页登录：本机起一次性回跳监听器，返回带 `desktop_callback=loopback` 的授权页 URL（见「网页登录」）。 |
+| GET | `/admin/api/login/loopback/status?state=…` | `admin.api_key` | 轮询自动回跳登录结果：`pending` / `success`+`id` / `failed`+`error`。 |
+| POST | `/admin/api/accounts/import-desktop` | `admin.api_key` | 只读导入本机桌面客户端登录态（`~/.box-agent/config/auth.json`）落账号（见「怎么拿到 token」）。 |
 
 `/admin/api/*` 的只读 GET：
 
@@ -307,15 +320,16 @@ curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>"
 
 浏览器打开 `http://<监听地址>/admin`（设置了 `admin.api_key` 时用 `/admin?key=<key>`）。
 
-- 展示状态，并提供**账号管理**（网页登录 / 手动新增 / 启用禁用 / 删除 / 测试）。
+- 展示状态，并提供**账号管理**（网页登录 / 自动回跳登录 / 手动新增 / 导入桌面端登录态 / 启用禁用 / 删除 / 测试）。
 - **每 5 秒自动刷新**一次；某次刷新失败时顶部显示「接口不可用」，但**不会清空**已展示的数据。
 - 自上而下包含六块：顶部状态条、账号池、积分卡、每日签到、模型目录、最近请求。
+- 积分卡会标注积分构成（取自账单分析）：已用多少、最近一批积分何时过期；会员卡显示 Office 会员状态与到期时间；构成查询失败不影响其余展示。
 - 页面为**单文件、零外部依赖**（无 CDN / 外部字体 / 图标），离线可用；暗色主题，窄屏可用（表格可横向滚动）。
 - 页面**不会**显示完整 `access_token` / `refresh_token` / `api_key`（接口本身也不返回，只显示尾 4 位）。
 
 ### 面板管理账号（写操作）
 
-> **前提：必须先在 `config.json` 里设置 `admin.api_key`。** 未设置时所有写操作返回 **403**，
+> **前提：必须先在 `src/config.json` 里设置 `admin.api_key`。** 未设置时所有写操作返回 **403**，
 > 并提示「请先在 config.json 里设置 admin.api_key，再使用账号管理功能」。只读 GET 不受影响。
 
 | 方法 | 路径 | 说明 |
@@ -324,9 +338,10 @@ curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>"
 | PATCH | `/admin/api/accounts/{id}` | 只改给出的字段：`name` / `priority` / `enabled` / `access_token` / `refresh_token`。成功 200。 |
 | DELETE | `/admin/api/accounts/{id}` | 删除账号。成功 200 `{"deleted":"<id>"}`。 |
 | POST | `/admin/api/accounts/{id}/test` | 用该账号当前 token 只读打一次上游目录，返回 `{"ok":true,"status":200,"models":<n>}`；上游失败也返回 HTTP 200，用 `{"ok":false,"status":<上游码>,"error":"…"}` 表达。 |
+| POST | `/admin/api/accounts/import-desktop` | 从本机桌面客户端登录态导入账号（只取 `access_token`；详见「怎么拿到 token」）。 |
 
 - 鉴权沿用 `/admin/api/*`：`Authorization: Bearer <key>` 或 `?key=<key>`。
-- 新增时 `id` = `user-<userId>`（从 JWT 解析，不验签）；取不到 userId 时用 `acct-<8 位随机十六进制>`。
+- 新增时 `id` = `user-<userId>`（从 JWT 解析，不验签；识别 `user_id` 等直接字段，以及十六进制形式的 `sid` / `iss`——真实小浣熊签发的 token 属于后者）；取不到 userId 时用 `acct-<8 位随机十六进制>`。
 - `expires_at` / `user_id` 从 JWT 解析；解析不出则 `expires_at = 0`（不主动刷新，靠 401 触发）、`user_id = ""`。
 - 每次写操作成功后**原子回写** `accounts.json`（临时文件 + rename、权限 `0600`、保留未知字段）。
 - 面板「账号池」表格的「操作」列即可启用/禁用、删除（二次确认）、测试；表格上方「新增账号」按钮展开表单。
@@ -341,7 +356,7 @@ curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>"
 流程（`login.enabled=true` 时）：
 
 1. 面板点「网页登录」→ `POST /admin/api/login/start`，服务用 `crypto/rand` 生成一次性
-   `state`（32 位十六进制，带过期时间）并返回授权页 URL：
+   `state`（64 位十六进制——授权页 loopback 契约要求的长度，带过期时间）并返回授权页 URL：
    `https://xiaohuanxiong.com/code/authorize?login_source=desktop&appname=…&state=…`。
 2. 打开该链接，在官方页面用微信/验证码/密码登录；成功后官方页面跳转自定义协议
    `office-raccoon://auth/callback?code=…&state=…`（浏览器打不开这个协议是正常的）。
@@ -355,22 +370,40 @@ curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>"
 |---|---|---|---|
 | POST | `/admin/api/login/start` | 无 | `{"url":…,"state":…,"expires_at":…,"ttl_seconds":…}` |
 | POST | `/admin/api/login/exchange` | `{"callback_url":"office-raccoon://auth/callback?code=…&state=…"}` 或 `{"code":…,"state":…}` | `{"id":"user-…","updated":false,"account":{…}}`（同 id 再登录一次为 `updated:true`） |
+| POST | `/admin/api/login/loopback/start` | 无 | `{"url":…,"state":…,"port":…,"expires_at":…,"ttl_seconds":…}`（URL 额外带 `desktop_callback=loopback` 与 `redirect=http://127.0.0.1:<port>/auth/callback`） |
+| GET | `/admin/api/login/loopback/status?state=…` | 无 | `{"status":"pending"}` / `{"status":"success","id":"user-…"}` / `{"status":"failed","error":"…"}` |
 
 - 鉴权沿用 `/admin/api/*`：`Authorization: Bearer <key>` 或 `?key=<key>`；`admin.api_key` 为空时返回 403。
 - **state 安全语义**：state 由本服务生成、内存 pending 表登记（带过期时间）；回调里的 state 必须与其中
   一条逐字相等且未过期，且**一次性消费**。校验失败/过期/缺失一律 400，且**不调用上游**。
   回调 URL 解析后逐项比对 `scheme=office-raccoon`、`host=auth`（大小写不敏感）、`path=/callback`，
   不使用前缀匹配。`code` ≤ 8192、`state` ≤ 512 字符。
-- `login.enabled=false` 时两个接口返回 403「网页登录已禁用（config.json 的 login.enabled=false）」，面板隐藏入口。
+- `login.enabled=false` 时登录相关接口返回 403「网页登录已禁用（config.json 的 login.enabled=false）」，面板隐藏入口。
 - 换回的 `office_identity` / `office_org_name` / `office_org_role` 非空时一并写入账号记录（作为未知字段保留）。
 - 日志只记 `[login]` 的 id/结果，**不打印 code 或 token**。
+
+### 自动回跳（desktop_callback=loopback）
+
+面板的**「自动回跳登录」**按钮走同一条授权页，但会额外带上 `desktop_callback=loopback` 与
+`redirect=http://127.0.0.1:<port>/auth/callback`，并在本机 `127.0.0.1` 随机端口起一个一次性
+回跳监听器。浏览器完成登录并确认授权后，授权页自动跳回该端口，由服务端直接换凭证落账号——
+全程无需手动复制回调地址。
+
+- 仅当浏览器与 xhx2api **同机**（能访问其 127.0.0.1）时可用；Docker / 远程部署里浏览器在别的
+  机器上，回调到不了，请继续用「网页登录」手动粘贴。
+- 同一时刻只保留一个回跳监听，新发起的会顶掉旧的（旧请求查询结果为 404）；`state_ttl_seconds`
+  到点后监听器自动关停并按「登录超时」落定。
+- 回跳监听器只接受：回跳 URL 里的那个 host、`GET /auth/callback`、逐字相等的 state；响应页
+  不含 code/token 且禁缓存。手动粘贴与回跳共用同一张 state 表，谁先消费谁生效。
+- 结果通过 `GET /admin/api/login/loopback/status?state=…` 轮询；失败原因（拒绝授权、授权码
+  失效、换取凭证失败、超时、被新请求取代）在 `error` 里给出。
 
 ---
 
 ## 挂进 CPA（CLIProxyAPI）
 
 本服务本身就是 OpenAI 兼容端点，在 CPA 里按 `openai-compatibility` 渠道挂即可，只需要三样东西：
-**base-url**、**api-key**（= 本服务 `config.json` 的 `api_key`）、**模型名**（就是上游 id，见 `/v1/models`；
+**base-url**、**api-key**（= 本服务 `src/config.json` 的 `api_key`）、**模型名**（就是上游 id，见 `/v1/models`；
 本服务**不做别名**）。
 
 ```yaml
@@ -412,6 +445,7 @@ curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>"
 - 触发时机：进程启动时若「今天还没成功」立即补签（`checkin.on_start`）→ 每天 `checkin.time`（默认 `00:01`，本地时区）→ 当天失败后按 `retry_interval_minutes` 重试。
 - 每个账号**每天最多成功一次**（靠 `data/checkin.json` 幂等判定，不会重复打上游）。
 - `verify_bills=true` 时，以「当日账单确有正数入账」为成功判据；否则以触发接口 `code==0` 为成功。
+- 签到成功时会顺带领取**一次性桌面端首登奖励**（`POST /api/web/desktop/v1/login/points/grant`，实测 `+3000`）：上游明确答复（发放与否）后在 `data/checkin.json` 记 `onboarding_settled`，之后不再询问；查询失败不拦签到，次日重试。领取结果单列在签到消息里（`桌面端首次登录奖励 +3000`），不与每日积分混计。
 - 结果会写入日志（`[Checkin] 账号 <id> 今日积分 +300` / 失败 warn），并可在面板「每日签到」表或 `GET /admin/api/checkin` 查看。
 - 设 `checkin.enabled=false` 可关闭后台任务（历史仍可读）。
 
@@ -440,13 +474,14 @@ curl -s -H 'Content-Type: application/json' -H "Authorization: Bearer <api_key>"
 - 面板「冷却中」列可看到状态。若频繁 429，降低请求频率或增加账号（`accounts.max_attempts` 决定一次请求最多换几个号）。
 
 **目录拉不到**
-- 不影响服务转发：会依次退回**持久化缓存文件** → **空**（来源显示 `empty`）。目录为空时 `/v1/models` 返回空列表；`validate=catalog` 会跳过校验、原样透传上游。
+- 不影响服务转发：会依次退回**持久化缓存文件** → **内置兜底表**（来源显示 `fallback`，一份上游已知模型清单，含默认对话模型 `raccoon-chat-ml-5-5`），`/v1/models` 不会是空列表。
+- 模型校验（`validate=catalog`）只看真实目录（`remote`/`cache`）：真实目录为空时跳过校验、原样透传上游；非空时按真实目录校验。
 - 排查：检查 `upstream.llm_base` 连通性与网络/代理；启动日志若有 `[catalog] 远程目录拉取失败…` 即为此问题。
-- 面板顶部「模型数（来源）」会显示当前来源是 `remote` / `cache` / `empty`。
+- 面板顶部「模型数（来源）」会显示当前来源是 `remote` / `cache` / `fallback`。
 
 **启动失败：未知键 `aliases` / `fallback`**
 - `models.aliases` 与 `models.fallback` 已在第四轮移除。配置里若仍留着这两个键，会因未知键报错并以退出码 2 启动失败。
-- 处理：从 `config.json` 删除这两个键；模型名直接使用上游 id（如 `sn-glm-5-3-flash`）。
+- 处理：从 `src/config.json` 删除这两个键；模型名直接使用上游 id（如 `sn-glm-5-3-flash`）。
 
 **账号文件写回失败**
 - 日志出现 `[pool] 警告：…账号文件…` 即写回失败。常见原因：`data/` 目录不可写、挂载为只读、磁盘满。

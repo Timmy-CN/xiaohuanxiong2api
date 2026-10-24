@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -47,9 +48,13 @@ func newLoginManager() *loginManager {
 	return &loginManager{pending: map[string]time.Time{}, now: time.Now}
 }
 
-// newLoginState 生成 16 字节随机 state → 32 位十六进制（SPEC5 §I）。
+// newLoginState 生成 32 字节随机 state → 64 位十六进制。
+//
+// 64 字符是授权页 loopback 契约的硬性要求（raccoon 插件实测：desktop_callback=loopback
+// 只认 64 字符十六进制 state，短了授权页直接报「授权链接无效」）；手动粘贴流程共用
+// 同一长度，上游对非 loopback 形态不做长度校验。
 func newLoginState() (string, error) {
-	var buf [16]byte
+	var buf [32]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return "", err
 	}
@@ -312,16 +317,7 @@ func (s *Server) adminLoginExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	account := &pool.Account{
-		ID:           accountIDFromToken(tokens.AccessToken),
-		UserID:       upstream.JWTUserID(tokens.AccessToken),
-		AccessToken:  tokens.AccessToken,
-		RefreshToken: tokens.RefreshToken,
-		ExpiresAt:    upstream.JWTExpiry(tokens.AccessToken),
-		Enabled:      true,
-		Priority:     100,
-	}
-	setOfficeFields(account, tokens)
+	account := loginAccountFromTokens(tokens)
 	updated, err := s.pool.Upsert(account)
 	if err != nil {
 		s.logger.Warnf("[login] 网页登录失败：回写账号文件失败")
@@ -358,6 +354,21 @@ func setOfficeFields(account *pool.Account, tokens *upstream.AuthorizationCode) 
 		}
 		account.SetExtra(key, raw)
 	}
+}
+
+// loginAccountFromTokens 把换回的凭证组装成账号记录（office_* 字段一并写入）。
+func loginAccountFromTokens(tokens *upstream.AuthorizationCode) *pool.Account {
+	account := &pool.Account{
+		ID:           accountIDFromToken(tokens.AccessToken),
+		UserID:       upstream.JWTUserID(tokens.AccessToken),
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		ExpiresAt:    upstream.JWTExpiry(tokens.AccessToken),
+		Enabled:      true,
+		Priority:     100,
+	}
+	setOfficeFields(account, tokens)
+	return account
 }
 
 // writeLoginExchangeError 把换凭证失败映射成 SPEC5 §K2 的状态码与中文文案。
@@ -423,4 +434,307 @@ func loginErrorTag(err error) string {
 		return "上游超时"
 	}
 	return "上游网络错误"
+}
+
+// ── 浏览器自动回跳（desktop_callback=loopback）──
+//
+// 与手动粘贴的区别：本机起一个一次性回跳监听器，授权页带上
+// desktop_callback=loopback 与 redirect=http://127.0.0.1:<port>/auth/callback，
+// 浏览器确认授权后会自动跳回本服务完成登录，无需手动复制回调地址。
+// 仅当浏览器与 xhx2api 同机（或能访问其 127.0.0.1）时可用；否则请用手动粘贴。
+
+// loopbackCallbackPath 是回跳监听器唯一接受的 GET 路径。
+const loopbackCallbackPath = "/auth/callback"
+
+// loopbackListener 是一次自动回跳登录的本地监听器及其结果。
+type loopbackListener struct {
+	state string
+	port  int
+	ln    net.Listener
+	srv   *http.Server
+	timer *time.Timer
+
+	mu        sync.Mutex
+	received  bool   // 已受理过一次有效回调（重复回调拒绝）
+	status    string // pending | success | failed
+	accountID string
+	errText   string
+}
+
+func newLoopbackListener(state string, port int) *loopbackListener {
+	return &loopbackListener{state: state, port: port, status: "pending"}
+}
+
+// snapshot 返回当前状态（供 status 轮询）。
+func (l *loopbackListener) snapshot() (status, accountID, errText string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.status, l.accountID, l.errText
+}
+
+// settle 落定结果并停掉监听；只有 pending 态才落定（幂等）。
+//
+// 立即关停监听端口（不再接受新回调），srv 延迟 1 秒再关：settle 多从回调
+// 处理器内部调用，同步 srv.Close() 会把在途的回调响应一起掐断。
+func (l *loopbackListener) settle(status, accountID, errText string) {
+	l.mu.Lock()
+	if l.status != "pending" {
+		l.mu.Unlock()
+		return
+	}
+	l.status = status
+	l.accountID = accountID
+	l.errText = errText
+	timer := l.timer
+	ln := l.ln
+	l.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
+	if ln != nil {
+		ln.Close()
+	}
+	time.AfterFunc(time.Second, func() { l.srv.Close() })
+}
+
+// loopbackManager 管理当前活动的回跳监听器；同一时刻只保留一个，
+// 新发起的会顶掉旧的（旧的结果随之一并作废）。
+type loopbackManager struct {
+	mu   sync.Mutex
+	item *loopbackListener
+}
+
+func (m *loopbackManager) replace(l *loopbackListener) {
+	m.mu.Lock()
+	prev := m.item
+	m.item = l
+	m.mu.Unlock()
+	if prev != nil {
+		prev.settle("failed", "", "已被新的自动回跳登录取代")
+	}
+}
+
+func (m *loopbackManager) lookup(state string) (*loopbackListener, bool) {
+	m.mu.Lock()
+	l := m.item
+	m.mu.Unlock()
+	if l != nil && l.state == state {
+		return l, true
+	}
+	return nil, false
+}
+
+// buildLoopbackAuthorizeURL 构造带自动回跳参数的授权页地址。
+//
+// 当前授权页的 loopback 契约（raccoon 插件实测）：desktop_callback=loopback，
+// redirect 指向 http://127.0.0.1:<port>/auth/callback。
+func buildLoopbackAuthorizeURL(origin, appName, state, redirect string) (string, error) {
+	base, err := url.Parse(origin)
+	if err != nil {
+		return "", err
+	}
+	base.Path = "/code/authorize"
+	query := base.Query()
+	query.Set("login_source", loginSource)
+	query.Set("appname", appName)
+	query.Set("state", state)
+	query.Set("desktop_callback", "loopback")
+	query.Set("redirect", redirect)
+	base.RawQuery = query.Encode()
+	return base.String(), nil
+}
+
+// newLoopbackHandler 生成回跳监听器的 HTTP 处理器。
+//
+// 只接受：回跳 URL 里的那个 host、GET /auth/callback、逐字相等的 state。
+// 响应页不含 code/token，且禁缓存。浏览器中途关页不会通知本服务，
+// 由 state 的 TTL 定时器兜底关停。
+func (s *Server) newLoopbackHandler(l *loopbackListener) http.Handler {
+	wantHost := fmt.Sprintf("127.0.0.1:%d", l.port)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reply := func(status int, text string) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(status)
+			_, _ = fmt.Fprint(w, text)
+		}
+		if r.URL.Path != loopbackCallbackPath || r.Host != wantHost {
+			reply(http.StatusNotFound, "Not found")
+			return
+		}
+		if r.Method != http.MethodGet {
+			reply(http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		q := r.URL.Query()
+		if q.Get("state") != l.state {
+			reply(http.StatusBadRequest, "回调不属于本次登录，请回到小浣熊反代重新发起。")
+			return
+		}
+		l.mu.Lock()
+		received := l.received
+		pending := l.status == "pending"
+		l.mu.Unlock()
+		if received || !pending {
+			reply(http.StatusConflict, "本次回调已经处理，请回到小浣熊反代查看结果。")
+			return
+		}
+		if q.Get("error") != "" {
+			reply(http.StatusBadRequest, "登录未获授权，请回到小浣熊反代重新发起。")
+			l.settle("failed", "", "上游授权被拒绝")
+			return
+		}
+		code := strings.TrimSpace(q.Get("code"))
+		if code == "" || len([]rune(code)) > maxLoginCodeLength {
+			reply(http.StatusBadRequest, "回调缺少有效授权码，请回到原授权页重试。")
+			return
+		}
+		// state 一次性消费：与手动粘贴路径共用同一张 pending 表，谁先到谁赢。
+		ok, expired := s.login.consume(l.state)
+		if !ok {
+			text := "回调不属于本次登录，请回到小浣熊反代重新发起。"
+			if expired {
+				text = "本次登录已超时，请重新发起自动回跳登录。"
+			}
+			reply(http.StatusBadRequest, text)
+			l.settle("failed", "", "登录状态已失效")
+			return
+		}
+		// 用独立于浏览器连接的超时：浏览器等不到响应就关页，登录也应完成。
+		ctx, cancel := context.WithTimeout(context.Background(), s.cfg.Upstream.RefreshTimeout())
+		defer cancel()
+		tokens, err := s.client.ExchangeAuthorizationCode(ctx, code)
+		if err != nil {
+			reply(http.StatusBadGateway, "登录未完成，请回到小浣熊反代查看错误并重试。")
+			l.settle("failed", "", "换取凭证失败："+loginErrorTag(err))
+			return
+		}
+		account := loginAccountFromTokens(tokens)
+		updated, err := s.pool.Upsert(account)
+		if err != nil {
+			reply(http.StatusBadGateway, "登录未完成，请回到小浣熊反代查看错误并重试。")
+			l.settle("failed", "", "回写账号文件失败："+err.Error())
+			return
+		}
+		s.logger.Infof("[login] 自动回跳登录成功 id=%s updated=%v", account.ID, updated)
+		reply(http.StatusOK, "登录成功，可以关闭此页并回到小浣熊反代。")
+		l.settle("success", account.ID, "")
+	})
+}
+
+// adminLoginLoopbackStart 实现 POST /admin/api/login/loopback/start。
+//
+// 返回授权页 URL（带 desktop_callback=loopback 与 redirect）与本地监听端口。
+func (s *Server) adminLoginLoopbackStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !s.requireAdminWrite(w) {
+		return
+	}
+	if !s.cfg.Login.LoginEnabled() {
+		writeError(w, http.StatusForbidden, apiError{
+			Message: "网页登录已禁用（config.json 的 login.enabled=false）",
+			Type:    typeAuthentication,
+			Code:    "login_disabled",
+		})
+		return
+	}
+	ttl := s.cfg.Login.StateTTL()
+	state, expiresAt, err := s.login.issue(ttl)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, apiError{
+			Message: "生成登录 state 失败：" + err.Error(),
+			Type:    typeUpstream,
+			Code:    "login_state_failed",
+		})
+		return
+	}
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		_, _ = s.login.consume(state) // 监听起不来就别留一个无法使用的 state
+		s.logger.Warnf("[login] 自动回跳监听启动失败：%v", err)
+		writeError(w, http.StatusInternalServerError, apiError{
+			Message: "启动回跳监听失败：" + err.Error(),
+			Type:    typeUpstream,
+			Code:    "loopback_listen_failed",
+		})
+		return
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	listener := newLoopbackListener(state, port)
+	listener.ln = ln
+	listener.srv = &http.Server{
+		Handler:           s.newLoopbackHandler(listener),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	s.loopback.replace(listener)
+	go func() { _ = listener.srv.Serve(ln) }()
+	listener.mu.Lock()
+	listener.timer = time.AfterFunc(ttl, func() {
+		listener.settle("failed", "", "登录超时，请重新发起自动回跳登录")
+	})
+	listener.mu.Unlock()
+
+	redirect := fmt.Sprintf("http://127.0.0.1:%d%s", port, loopbackCallbackPath)
+	authorizeURL, err := buildLoopbackAuthorizeURL(s.cfg.Upstream.OriginURL(), s.cfg.Login.LoginAppName(), state, redirect)
+	if err != nil {
+		listener.settle("failed", "", "构造登录地址失败")
+		s.logger.Warnf("[login] 自动回跳登录地址构造失败：%v", err)
+		writeError(w, http.StatusInternalServerError, apiError{
+			Message: "构造登录地址失败：" + err.Error(),
+			Type:    typeUpstream,
+			Code:    "login_url_failed",
+		})
+		return
+	}
+	s.logger.Infof("[login] 发起自动回跳登录 port=%d", port)
+	writeJSONUnescaped(w, http.StatusOK, map[string]any{
+		"url":         authorizeURL,
+		"state":       state,
+		"port":        port,
+		"expires_at":  expiresAt,
+		"ttl_seconds": int(ttl.Seconds()),
+	})
+}
+
+// adminLoginLoopbackStatus 实现 GET /admin/api/login/loopback/status?state=…。
+//
+// status: pending（等待回调）/ success（id 为新登录的账号）/ failed（error 为原因）。
+func (s *Server) adminLoginLoopbackStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !s.requireAdminWrite(w) {
+		return
+	}
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if state == "" {
+		writeError(w, http.StatusBadRequest, apiError{
+			Message: "缺少 state 参数",
+			Type:    typeInvalidRequest,
+			Code:    "state_required",
+		})
+		return
+	}
+	listener, ok := s.loopback.lookup(state)
+	if !ok {
+		writeError(w, http.StatusNotFound, apiError{
+			Message: "没有进行中的自动回跳登录（可能已过期、被新请求取代或服务已重启）",
+			Type:    typeInvalidRequest,
+			Code:    "loopback_not_found",
+		})
+		return
+	}
+	status, accountID, errText := listener.snapshot()
+	payload := map[string]any{"status": status}
+	if accountID != "" {
+		payload["id"] = accountID
+	}
+	if errText != "" {
+		payload["error"] = errText
+	}
+	writeJSON(w, http.StatusOK, payload)
 }

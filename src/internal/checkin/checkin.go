@@ -253,7 +253,52 @@ func (s *Service) checkAccount(ctx context.Context, view pool.AccountView) {
 		}
 		msg = fmt.Sprintf("今日积分 +%d", points)
 	}
+	// 一次性桌面端首登奖励：账单先读后领，奖励即使随后落成账单也不会混进
+	// 上面的 points，消息里单列，不会重复计数。
+	if onboardPts := s.claimOnboarding(ctx, view.ID, token); onboardPts > 0 {
+		msg += fmt.Sprintf("；桌面端首次登录奖励 +%d", onboardPts)
+	}
 	s.recordSuccess(view.ID, today, points, msg, popups, toast)
+}
+
+// claimOnboarding 领取一次性桌面端首登奖励，返回本次领取到的积分（0 = 无可报）。
+//
+// 已结算（含上游 granted=false 的「早已领取」）后不再询问；查询失败保持未结算
+// 下次签到再试，且绝不拦截本次签到。
+func (s *Service) claimOnboarding(ctx context.Context, id, token string) int64 {
+	s.mu.Lock()
+	settled := s.state.account(id).OnboardingSettled
+	s.mu.Unlock()
+	if settled {
+		return 0
+	}
+
+	grant, err := s.client.ClaimOnboardingGrant(ctx, token)
+	if err != nil {
+		var statusErr *upstream.StatusError
+		if errors.As(err, &statusErr) && statusErr.Status == 401 {
+			refreshed, refreshErr := s.pool.Token(ctx, id, true)
+			if refreshErr != nil {
+				s.logger.Debugf("[Checkin] 账号 %s 首登奖励：强制刷新失败（%v）", id, refreshErr)
+				return 0
+			}
+			grant, err = s.client.ClaimOnboardingGrant(ctx, refreshed)
+		}
+	}
+	if err != nil {
+		s.logger.Debugf("[Checkin] 账号 %s 首登奖励查询失败（保持未结算）：%v", id, err)
+		return 0
+	}
+
+	s.mu.Lock()
+	s.state.account(id).OnboardingSettled = true
+	s.mu.Unlock()
+	s.save()
+	if !grant.Granted {
+		return 0
+	}
+	s.logger.Infof("[Checkin] 账号 %s 桌面端首次登录奖励 +%d", id, grant.Points)
+	return grant.Points
 }
 
 // todayPoints 汇总今日入账：points > 0 且 created_at 前 10 位 == 本地当天。

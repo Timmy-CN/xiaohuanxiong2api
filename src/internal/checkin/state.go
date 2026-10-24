@@ -63,6 +63,8 @@ type AccountState struct {
 	AttemptsToday int            `json:"attempts_today"`
 	LastError     string         `json:"last_error"`
 	History       []HistoryEntry `json:"history"`
+	// 桌面端首登奖励是一次性的：上游明确答复（无论发放与否）后不再询问。
+	OnboardingSettled bool `json:"onboarding_settled"`
 
 	extra map[string]json.RawMessage
 }

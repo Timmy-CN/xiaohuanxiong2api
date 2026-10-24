@@ -180,3 +180,95 @@ func TestPersistPreservesUnknownFields(t *testing.T) {
 		t.Fatalf("未知字段 nested 丢失: %s", data)
 	}
 }
+
+// issJWT 造一个含 exp 与十六进制 iss 的假 JWT（真实小浣熊签发形态，uid 由 iss 派生）。
+func issJWT(exp int64, iss string) string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d,"iss":%q}`, exp, iss)))
+	return header + "." + payload + ".sig"
+}
+
+// writeDesktopAuth 把 auth.json 写进独立目录并把环境变量指过去。
+func writeDesktopAuth(t *testing.T, accessToken string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(fmt.Sprintf(`{"access_token": %q, "refresh_token": "desktop-rt"}`, accessToken)), 0o600); err != nil {
+		t.Fatalf("写 auth.json 失败: %v", err)
+	}
+	t.Setenv("RACCOON_BOX_AGENT_CONFIG_DIR", dir)
+	t.Setenv("BOX_AGENT_CONFIG_DIR", "")
+}
+
+// 活席：desktop 源账号取 token 前自动接管 auth.json 里同一账号的更新 token，
+// 并回写账号文件（含 source 标记）；refresh_token 为空的桌面账号不触发刷新。
+func TestDesktopSeatAdoptsNewerToken(t *testing.T) {
+	newToken := issJWT(time.Now().Add(48*time.Hour).Unix(), "74350b") // 0x74350b = 7615755
+	writeDesktopAuth(t, newToken)
+
+	client, _ := newRefreshStub(t, makeJWT(time.Now().Add(24*time.Hour).Unix()), 0)
+	file := writeAccounts(t, []map[string]any{{
+		"id": "user-7615755", "name": "桌面", "user_id": "7615755", "access_token": issJWT(time.Now().Add(1*time.Hour).Unix(), "74350b"),
+		"refresh_token": "", "expires_at": time.Now().Add(time.Hour).UnixMilli(),
+		"enabled": true, "priority": 1, "source": "desktop",
+	}})
+	p := New(Config{File: file, Strategy: "priority", RefreshMarginSeconds: 300, CooldownSeconds: 600, MaxAttempts: 3, RefreshOn401: true}, client, testLogger())
+
+	token, err := p.Token(context.Background(), "user-7615755", false)
+	if err != nil {
+		t.Fatalf("Token 失败: %v", err)
+	}
+	if token != newToken {
+		t.Fatalf("应接管桌面端新 token")
+	}
+
+	data, _ := os.ReadFile(file)
+	if !strings.Contains(string(data), newToken) || !strings.Contains(string(data), `"source": "desktop"`) {
+		t.Fatalf("接管结果未回写账号文件: %s", data)
+	}
+}
+
+// uid 不一致（客户端换了账号）绝不接管；文件缺失也静默沿用原 token。
+func TestDesktopSeatNeverAdoptsOtherAccount(t *testing.T) {
+	otherAccountToken := issJWT(time.Now().Add(48*time.Hour).Unix(), "ffff01") // 另一个账号
+	writeDesktopAuth(t, otherAccountToken)
+	ownToken := issJWT(time.Now().Add(1*time.Hour).Unix(), "74350b")
+
+	client, _ := newRefreshStub(t, makeJWT(time.Now().Add(24*time.Hour).Unix()), 0)
+	file := writeAccounts(t, []map[string]any{{
+		"id": "user-7615755", "name": "桌面", "access_token": ownToken,
+		"refresh_token": "", "expires_at": time.Now().Add(time.Hour).UnixMilli(),
+		"enabled": true, "priority": 1, "source": "desktop",
+	}})
+	p := New(Config{File: file, Strategy: "priority", RefreshMarginSeconds: 300, CooldownSeconds: 600, MaxAttempts: 3, RefreshOn401: true}, client, testLogger())
+
+	token, err := p.Token(context.Background(), "user-7615755", false)
+	if err != nil {
+		t.Fatalf("Token 失败: %v", err)
+	}
+	if token != ownToken {
+		t.Fatalf("uid 不一致时不应接管: got %q", token)
+	}
+}
+
+// 普通账号（source 为空）不读桌面端文件。
+func TestDesktopSyncSkipsNormalAccounts(t *testing.T) {
+	newToken := issJWT(time.Now().Add(48*time.Hour).Unix(), "74350b")
+	writeDesktopAuth(t, newToken)
+	ownToken := issJWT(time.Now().Add(1*time.Hour).Unix(), "74350b")
+
+	client, _ := newRefreshStub(t, makeJWT(time.Now().Add(24*time.Hour).Unix()), 0)
+	file := writeAccounts(t, []map[string]any{{
+		"id": "user-7615755", "name": "普通", "access_token": ownToken,
+		"refresh_token": "rt", "expires_at": time.Now().Add(time.Hour).UnixMilli(),
+		"enabled": true, "priority": 1,
+	}})
+	p := New(Config{File: file, Strategy: "priority", RefreshMarginSeconds: 300, CooldownSeconds: 600, MaxAttempts: 3, RefreshOn401: true}, client, testLogger())
+
+	token, err := p.Token(context.Background(), "user-7615755", false)
+	if err != nil {
+		t.Fatalf("Token 失败: %v", err)
+	}
+	if token != ownToken {
+		t.Fatalf("非 desktop 账号不应接管: got %q", token)
+	}
+}

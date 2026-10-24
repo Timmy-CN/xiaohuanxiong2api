@@ -26,9 +26,15 @@ type stub struct {
 	setting401First bool
 	billsItems      []upstream.Bill
 
-	settingCount int64
-	billsCount   int64
-	refreshCount int64
+	onboardingGranted  bool
+	onboardingPoints   int64 // >0 时下发 popup.points；0 = popup 缺失
+	failOnboarding     bool
+	onboarding401First bool
+
+	settingCount    int64
+	billsCount      int64
+	refreshCount    int64
+	onboardingCount int64
 }
 
 func (s *stub) currentDay() string {
@@ -68,6 +74,23 @@ func (s *stub) handler() http.HandlerFunc {
 				items = []upstream.Bill{}
 			}
 			stubJSON(w, http.StatusOK, map[string]any{"code": 0, "data": map[string]any{"items": items}})
+		case "/api/web/desktop/v1/login/points/grant":
+			n := atomic.AddInt64(&s.onboardingCount, 1)
+			if s.onboarding401First && n == 1 {
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 200003, "message": "authorization_verify_error"})
+				return
+			}
+			if s.failOnboarding {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]any{"code": 500, "message": "boom"})
+				return
+			}
+			data := map[string]any{"granted": s.onboardingGranted}
+			if s.onboardingPoints > 0 {
+				data["popup"] = map[string]any{"points": s.onboardingPoints}
+			}
+			stubJSON(w, http.StatusOK, map[string]any{"code": 0, "message": "ok", "data": data})
 		case "/refresh":
 			atomic.AddInt64(&s.refreshCount, 1)
 			stubJSON(w, http.StatusOK, map[string]any{
@@ -138,6 +161,20 @@ func bill(day string, points int64) upstream.Bill {
 		BillID: "b1", ClientType: "web", EventName: "每日积分发放", BizType: "daily_grant",
 		Points: points, CreatedAt: day + "T00:00:17+08:00",
 	}
+}
+
+// readCheckinState 读取签到历史文件（断言落定标志用）。
+func readCheckinState(t *testing.T, svc *Service) *State {
+	t.Helper()
+	data, err := os.ReadFile(svc.cfg.HistoryFile)
+	if err != nil {
+		t.Fatalf("读取签到历史失败: %v", err)
+	}
+	var state State
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("解析签到历史失败: %v", err)
+	}
+	return &state
 }
 
 // 用例 1：setting_info code==0 + bills 有今日入账 300 → success=true、points=300；
@@ -329,5 +366,134 @@ func TestParseClock(t *testing.T) {
 		if _, _, err := parseClock(bad); err == nil {
 			t.Fatalf("parseClock(%q) 应报错", bad)
 		}
+	}
+}
+
+// 首登奖励：首次签到顺带领取 +3000，消息单列，积分口径保持账单原值。
+func TestCheckinClaimsOnboardingGrant(t *testing.T) {
+	s := &stub{
+		billsItems:        []upstream.Bill{bill("2026-10-09", 300)},
+		onboardingGranted: true,
+		onboardingPoints:  3000,
+	}
+	svc, _ := newService(t, s, nil)
+
+	svc.CheckAll(context.Background())
+
+	view := svc.Views()[0]
+	if view.Today.Points != 300 {
+		t.Fatalf("points = %d, 期望 300（首登奖励不入账单口径）", view.Today.Points)
+	}
+	if view.Today.Msg != "今日积分 +300；桌面端首次登录奖励 +3000" {
+		t.Fatalf("msg = %q", view.Today.Msg)
+	}
+	if got := atomic.LoadInt64(&s.onboardingCount); got != 1 {
+		t.Fatalf("首登奖励调用次数 = %d, 期望 1", got)
+	}
+	state := readCheckinState(t, svc)
+	if !state.Accounts["user-7591340"].OnboardingSettled {
+		t.Fatal("onboarding_settled 应为 true")
+	}
+}
+
+// granted=true 但 popup 缺失 → 按 3000 计。
+func TestCheckinOnboardingPointsFallback(t *testing.T) {
+	s := &stub{
+		billsItems:        []upstream.Bill{bill("2026-10-09", 300)},
+		onboardingGranted: true,
+	}
+	svc, _ := newService(t, s, nil)
+
+	svc.CheckAll(context.Background())
+
+	if msg := svc.Views()[0].Today.Msg; msg != "今日积分 +300；桌面端首次登录奖励 +3000" {
+		t.Fatalf("popup 缺失时应按 3000 计: msg = %q", msg)
+	}
+}
+
+// granted=false（早已领取）同样视为已结算，消息不带奖励条目。
+func TestCheckinOnboardingAlreadyGranted(t *testing.T) {
+	s := &stub{
+		billsItems:        []upstream.Bill{bill("2026-10-09", 300)},
+		onboardingGranted: false,
+	}
+	svc, advance := newService(t, s, nil)
+
+	svc.CheckAll(context.Background())
+	if msg := svc.Views()[0].Today.Msg; msg != "今日积分 +300" {
+		t.Fatalf("msg = %q, 期望不含首登奖励", msg)
+	}
+	state := readCheckinState(t, svc)
+	if !state.Accounts["user-7591340"].OnboardingSettled {
+		t.Fatal("granted=false 也应标记已结算")
+	}
+
+	// 次日签到不再询问首登奖励。
+	advance(time.Date(2026, 10, 10, 0, 30, 0, 0, time.Local))
+	s.billsItems = []upstream.Bill{bill("2026-10-10", 300)}
+	svc.CheckAll(context.Background())
+
+	if got := atomic.LoadInt64(&s.onboardingCount); got != 1 {
+		t.Fatalf("次日不应再调首登奖励接口，实际 = %d", got)
+	}
+	if got := atomic.LoadInt64(&s.settingCount); got != 2 {
+		t.Fatalf("setting_info 次数 = %d, 期望 2", got)
+	}
+	if msg := svc.Views()[0].Today.Msg; msg != "今日积分 +300" {
+		t.Fatalf("次日 msg = %q, 期望不含首登奖励", msg)
+	}
+}
+
+// 首登奖励查询失败不拦截签到，保持未结算，次日重试。
+func TestCheckinOnboardingFailureDoesNotBlock(t *testing.T) {
+	s := &stub{
+		billsItems:     []upstream.Bill{bill("2026-10-09", 300)},
+		failOnboarding: true,
+	}
+	svc, advance := newService(t, s, nil)
+
+	svc.CheckAll(context.Background())
+
+	view := svc.Views()[0]
+	if !view.Today.Success || view.Today.Msg != "今日积分 +300" {
+		t.Fatalf("首登奖励失败不应影响签到: %+v", view.Today)
+	}
+	state := readCheckinState(t, svc)
+	if state.Accounts["user-7591340"].OnboardingSettled {
+		t.Fatal("失败时不应标记已结算")
+	}
+
+	advance(time.Date(2026, 10, 10, 0, 30, 0, 0, time.Local))
+	s.failOnboarding = false
+	s.onboardingGranted = true
+	s.onboardingPoints = 3000
+	s.billsItems = []upstream.Bill{bill("2026-10-10", 300)}
+	svc.CheckAll(context.Background())
+
+	if got := atomic.LoadInt64(&s.onboardingCount); got != 2 {
+		t.Fatalf("次日应重试首登奖励，调用次数 = %d, 期望 2", got)
+	}
+	if msg := svc.Views()[0].Today.Msg; msg != "今日积分 +300；桌面端首次登录奖励 +3000" {
+		t.Fatalf("重试成功后 msg = %q", msg)
+	}
+}
+
+// 首登奖励 401 → 强制刷新后重试一次。
+func TestCheckinOnboarding401ForcesRefresh(t *testing.T) {
+	s := &stub{
+		billsItems:         []upstream.Bill{bill("2026-10-09", 300)},
+		onboardingGranted:  true,
+		onboardingPoints:   3000,
+		onboarding401First: true,
+	}
+	svc, _ := newService(t, s, nil)
+
+	svc.CheckAll(context.Background())
+
+	if got := atomic.LoadInt64(&s.refreshCount); got != 1 {
+		t.Fatalf("refresh 次数 = %d, 期望 1", got)
+	}
+	if msg := svc.Views()[0].Today.Msg; msg != "今日积分 +300；桌面端首次登录奖励 +3000" {
+		t.Fatalf("msg = %q", msg)
 	}
 }
