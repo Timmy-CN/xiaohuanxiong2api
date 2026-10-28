@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -271,4 +273,48 @@ func TestDesktopSyncSkipsNormalAccounts(t *testing.T) {
 	if token != ownToken {
 		t.Fatalf("非 desktop 账号不应接管: got %q", token)
 	}
+}
+
+// TestDesktopAuthPathProfiles 插件 0.1.4（#459）口径：新客户端的
+// client profile（Windows %USERPROFILE%\.office-raccoon / macOS
+// Application Support\office-raccoon）优先于旧版 ~/.box-agent。
+func TestDesktopAuthPathProfiles(t *testing.T) {
+	// 环境变量显式覆盖仍是最高优先级
+	t.Setenv("RACCOON_BOX_AGENT_CONFIG_DIR", t.TempDir())
+	want := filepath.Join(os.Getenv("RACCOON_BOX_AGENT_CONFIG_DIR"), "auth.json")
+	if got := DesktopAuthPath(); got != want {
+		t.Fatalf("env 覆盖应优先: got %s want %s", got, want)
+	}
+	os.Unsetenv("RACCOON_BOX_AGENT_CONFIG_DIR")
+	os.Unsetenv("BOX_AGENT_CONFIG_DIR")
+
+	// 本机布局探测（Windows: %APPDATA%\office-raccoon → ~/.office-raccoon →
+	// ~/.box-agent；Linux: XDG_CONFIG_HOME/office-raccoon → ~/.box-agent）
+	// 只断言「返回的路径合法且在候选集里」，具体命中哪层取决于本机。
+	got := DesktopAuthPath()
+	switch runtime.GOOS {
+	case "windows":
+		valid := []string{
+			filepath.Join(os.Getenv("APPDATA"), "office-raccoon", "agent", "config", "auth.json"),
+			filepath.Join(mustHome(t), ".office-raccoon", "agent", "config", "auth.json"),
+			filepath.Join(mustHome(t), ".box-agent", "config", "auth.json"),
+		}
+		if !slices.Contains(valid, got) {
+			t.Fatalf("got %s not in candidates %v", got, valid)
+		}
+	default:
+		if !strings.HasSuffix(got, filepath.Join("office-raccoon", "agent", "config", "auth.json")) &&
+			!strings.HasSuffix(got, filepath.Join(".box-agent", "config", "auth.json")) {
+			t.Fatalf("got %s 不在候选布局里", got)
+		}
+	}
+}
+
+func mustHome(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return home
 }

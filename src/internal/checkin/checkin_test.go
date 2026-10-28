@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -352,8 +353,11 @@ func TestStatePreservesUnknownFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stat 失败: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o600 {
-		t.Fatalf("文件权限 = %o, 期望 600", perm)
+	// Windows 的 Stat 恒报 0666（无 POSIX 权限位），0600 断言仅在 POSIX 有意义。
+	if runtime.GOOS != "windows" {
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Fatalf("文件权限 = %o, 期望 600", perm)
+		}
 	}
 }
 
